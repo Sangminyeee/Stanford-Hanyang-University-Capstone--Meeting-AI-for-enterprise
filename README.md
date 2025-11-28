@@ -1,12 +1,9 @@
-# Stanford-Hanyang-University-Capstone--Meeting-AI-for-enterprise
-AI-powered enterprise meeting facilitation system designed to analyze cognitive load and speaking patterns, enhance meeting efficiency, and provide real-time, data-driven feedback for organizations.
-
 <div align="center">
 
 # 🎓 Stanford University Capstone  
 ## **Enterprise AI Meeting Facilitation System**
 
-### _AI-powered platform for real-time meeting analysis, cognitive load monitoring, and enhanced communication efficiency._
+### _AI-powered enterprice-customized platform for real-time meeting analysis, cognitive load monitoring, and enhanced communication efficiency._
 
 </div>
 
