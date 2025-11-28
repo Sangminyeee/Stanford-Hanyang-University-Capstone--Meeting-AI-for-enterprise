@@ -3,7 +3,7 @@
 # 🎓 Stanford University Capstone  
 ## **Enterprise AI Meeting Facilitation System**
 
-### _AI-powered enterprice-customized platform for real-time meeting analysis, cognitive load monitoring, and enhanced communication efficiency._
+### _AI-powered platform for real-time meeting analysis, cognitive load monitoring, and enhanced communication efficiency._
 
 </div>
 
@@ -30,3 +30,31 @@ Documentation contains architectural design, planning logs, and research notes.
 
 ## 📁 Project Structure
 
+```plaintext
+/src
+   /hardware
+        - Edge device & audio preprocessing
+        - Sensor integration
+        - Microcontroller (e.g., Raspberry Pi, Arduino) code
+
+   /web
+        - Live meeting feedback UI
+        - Analytics dashboard
+        - Backend API integration
+
+   /ai
+        - Whisper / Deepgram STT pipeline
+        - Speaker diarization
+        - Topic drift detection
+        - Meeting metrics & AI models
+
+/docs
+   - System architecture diagrams
+   - UX/UI design & wireframes
+   - Research notes & literature review
+   - Meeting logs & planning documents
+
+/tests
+   - Unit tests
+   - Integration tests
+   - Experimental scripts
