@@ -1,5 +1,3 @@
-# ver3에서 VAD, 비동기 적용 버전
-
 import os
 import sys
 import numpy as np
@@ -30,27 +28,31 @@ from tqdm import tqdm
 load_dotenv()
 HF_TOKEN = os.getenv("HF_TOKEN")
 
+# TF32 가속
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 # 설정값
 DEVICE_INDEX = 1  # 장치 번호
 SAMPLE_RATE = 16000
-MAX_STRIKES = 2  # 이탈 허용 횟수
 BUFFER_SIZE = 4  # 묶어서 요약할 문장 수
 FLOW_THRESHOLD = 0.3  # 주제 유사도 임계값
 WHISPER_MODEL_SIZE = "medium"  # Whisper 모델 크기 (small, medium, large-v3)
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.dirname(CURRENT_DIR)
-MODELS_DIR = os.path.join(PARENT_DIR, "models") # 모델 저장 폴더
-LOGS_DIR = os.path.join(PARENT_DIR, "log") # 로그 저장 폴더
+MODELS_DIR = os.path.join(PARENT_DIR, "models")  # 모델 저장 폴더
+LOGS_DIR = os.path.join(PARENT_DIR, "log")  # 로그 저장 폴더
 
 # 침묵 감지
 SILENCE_THRESHOLD = 500  # 최소 소리 (이거 넘어야 녹음됨)
 SILENCE_DURATION = 0.3  # 몇초 이상 조용해야하는지
-MIN_AUDIO_LEN = 1.0  # 최소 몇초 이상 말해야하는지
+MIN_AUDIO_LEN = 0.8  # 최소 몇초 이상 말해야하는지
 
 # CUDA 없으면 오류날 수 있음 주의!
 DEVICE = "cuda"
 COMPUTE_TYPE = "float16"
+
 
 
 # 모델 다운로드하는 함수
@@ -163,7 +165,6 @@ class MeetingAssistant:
         # self.todo_list = []
         self.meeting_topic = ""
         self.topic_embedding = None
-        self.off_topic_strikes = 0
 
         # 화자 기억용
         self.speaker_bank = {}  # 화자 벡터 저장해놓는거
@@ -185,14 +186,24 @@ class MeetingAssistant:
 
     # 텍스트 요약 함수
     def _run_summarize(self, text):
-        try:
-            inputs = self.tokenizer("summarize: " + text, max_length=512, truncation=True, return_tensors="pt").to(
-                DEVICE)
-            output = self.summarizer.generate(**inputs, max_length=128, min_length=10, num_beams=4, length_penalty=2.0,
-                                              early_stopping=True)
-            return self.tokenizer.decode(output[0], skip_special_tokens=True)
-        except:
-            return text
+        input_text = "summarize: " + text
+        inputs = self.tokenizer(input_text, max_length=1024, truncation=True, return_tensors="pt").to(DEVICE)
+        output = self.summarizer.generate(
+            **inputs,
+            max_length=150,  # 요약문 최대 길이
+            min_length=20,  # 요약문 최소 길이
+            num_beams=5,  # 탐색 폭
+            early_stopping=True,
+
+            # 같은 단어 구절 3번 이상 시 차단
+            no_repeat_ngram_size=3,
+
+            # 길이 패널티
+            length_penalty=1.2
+        )
+
+        summary = self.tokenizer.decode(output[0], skip_special_tokens=True)
+        return summary
 
     # 판별 모델 함수
     def _run_embedding(self, text):
@@ -201,6 +212,10 @@ class MeetingAssistant:
     # 화자 식별 함수
     def _run_speaker_id(self, audio_np):
         try:
+            if len(audio_np) / SAMPLE_RATE < 1.0:
+                print("샘플레이트 문제")
+                return "Unknown"
+
             audio_tensor = torch.from_numpy(audio_np).float().unsqueeze(0).to(DEVICE)
             embedding_result = self.inference({"waveform": audio_tensor, "sample_rate": SAMPLE_RATE})
 
@@ -210,9 +225,10 @@ class MeetingAssistant:
                 new_emb = embedding_result
 
             if not self.speaker_bank:
-                self.speaker_bank[f"Speaker {self.speaker_counter}"] = new_emb
+                name = f"Speaker {self.speaker_counter}"
+                self.speaker_bank[name] = new_emb
                 self.speaker_counter += 1
-                return f"Speaker {self.speaker_counter - 1}"
+                return name
 
             min_dist = 100.0
             best_match = None
@@ -225,9 +241,10 @@ class MeetingAssistant:
             if min_dist < self.SPEAKER_SIMILARITY_THRESHOLD:
                 return best_match
             else:
-                self.speaker_bank[f"Speaker {self.speaker_counter}"] = new_emb
+                new_name = f"Speaker {self.speaker_counter}"
+                self.speaker_bank[new_name] = new_emb
                 self.speaker_counter += 1
-                return f"Speaker {self.speaker_counter - 1}"
+                return new_name
         except:
             return "Unknown"
 
@@ -245,12 +262,9 @@ class MeetingAssistant:
             if self.topic_embedding is not None:
                 emb = await asyncio.to_thread(self._run_embedding, summary)
                 score = util.cos_sim(self.topic_embedding, emb).item()
+
                 if score < FLOW_THRESHOLD:
-                    self.off_topic_strikes += 1
-                    if self.off_topic_strikes >= MAX_STRIKES:
-                        print(f"\n[Warning] 논점 이탈 감지 (유사도: {score:.2f})")
-                else:
-                    self.off_topic_strikes = 0
+                    print(f"\n[Warning] 논점 이탈 감지 (유사도: {score:.2f})")
         except Exception as e:
             print(f"분석 에러: {e}")
 
@@ -259,11 +273,13 @@ class MeetingAssistant:
         try:
             # 1. Whisper 실행
             text_chunk = await asyncio.to_thread(self._run_whisper, audio_np)
+            
+            # 중복방지
+            last_text = self.transcript_buffer[-1] if self.transcript_buffer else ""
 
-            if text_chunk:
+            if text_chunk and text_chunk != last_text:
                 # 2. 화자 식별
                 speaker = await asyncio.to_thread(self._run_speaker_id, audio_np)
-
                 log_text = f"[{speaker}] {text_chunk}"
                 print(f"   {log_text}")
 
@@ -274,8 +290,7 @@ class MeetingAssistant:
                 if len(self.transcript_buffer) >= BUFFER_SIZE:
                     full_text = " ".join(self.transcript_buffer)
                     self.transcript_buffer = []
-
-                    # 4. 분석 작업을 백그라운드 태스크로 던짐 (await 안 함 -> 즉시 리턴)
+                    # 4. 분석 작업을 백그라운드 태스크로
                     asyncio.create_task(self.analyze_task(full_text))
 
         except Exception as e:
