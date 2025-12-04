@@ -86,5 +86,8 @@ or
 나중에 모델 바꿀거기도 하고 아직 하이퍼파라미터 최적화를 못시켜서
 추후에 진행해야겠다
 
-### 웹뷰용
+### 웹뷰용 실행
 ```streamlit run web_view_test/webview_vibe_ver1.py```
+
+### 코드용 실행
+```uv run .\main_functionality\main_ver1.py```
