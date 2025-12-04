@@ -208,4 +208,4 @@ __marimo__/
 # Project setting
 /models
 /log
-test/testing_code.py
+/test
