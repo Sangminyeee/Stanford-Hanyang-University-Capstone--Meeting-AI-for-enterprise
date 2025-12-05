@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { PageHeader } from "@/components/layout/PageHeader";
 import { Button } from "@/components/common/Button";
 import { MeetingsTable } from "@/components/meetings/MeetingsTable";
@@ -8,9 +9,11 @@ export default function MeetingsPage() {
       <PageHeader
         title="Meetings"
         action={
-          <Button variant="primary" size="md">
-            + New Meeting
-          </Button>
+          <Link href="/meetings/new">
+            <Button variant="primary" size="md">
+              + New Meeting
+            </Button>
+          </Link>
         }
       />
       <MeetingsTable />

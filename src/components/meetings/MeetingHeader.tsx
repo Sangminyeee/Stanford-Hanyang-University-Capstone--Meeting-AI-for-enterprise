@@ -47,9 +47,14 @@ export function MeetingHeader({
       <div className="flex flex-wrap items-center gap-4 mb-4">
         <div className="flex items-center gap-2">
           <span className="text-sm text-slate-600">Attendees:</span>
-          <span className="text-sm text-slate-700">
-            {attendees.join(", ")}
-          </span>
+          <div className="flex items-center gap-2">
+            {attendees.map((attendee, index) => (
+              <div key={index} className="flex items-center gap-2">
+                <div className="w-5 h-5 bg-slate-300 rounded-full"></div>
+                <span className="text-sm text-slate-700">{attendee}</span>
+              </div>
+            ))}
+          </div>
         </div>
       </div>
       <div className="flex flex-wrap items-center gap-3">
@@ -58,9 +63,17 @@ export function MeetingHeader({
           <span className="text-sm font-medium text-slate-900">{project}</span>
         </div>
         <div className="flex items-center gap-2">
-          <span className="text-sm text-slate-600">Tags:</span>
+          <span className="text-sm text-slate-600">Tag:</span>
           {tags.map((tag) => (
-            <Badge key={tag} variant="tag">
+            <Badge
+              key={tag}
+              variant="tag"
+              className={
+                tag === "Design"
+                  ? "bg-blue-50 text-blue-700"
+                  : "bg-slate-100 text-slate-700"
+              }
+            >
               {tag}
             </Badge>
           ))}

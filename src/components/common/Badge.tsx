@@ -6,6 +6,11 @@ type BadgeVariant =
   | "status-in-progress"
   | "status-overdue"
   | "status-scheduled"
+  | "status-deferred"
+  | "status-discussion-needed"
+  | "status-agreed"
+  | "status-revision-needed"
+  | "status-unknown"
   | "tag";
 
 interface BadgeProps {
@@ -22,6 +27,11 @@ export function Badge({ variant, children, className }: BadgeProps) {
     "status-in-progress": "bg-blue-50 text-blue-700",
     "status-overdue": "bg-rose-50 text-rose-700",
     "status-scheduled": "bg-slate-50 text-slate-700",
+    "status-deferred": "bg-slate-50 text-slate-700",
+    "status-discussion-needed": "bg-orange-50 text-orange-700",
+    "status-agreed": "bg-emerald-50 text-emerald-700",
+    "status-revision-needed": "bg-orange-50 text-orange-700",
+    "status-unknown": "bg-slate-50 text-slate-700",
     tag: "bg-slate-100 text-slate-700",
   };
   
