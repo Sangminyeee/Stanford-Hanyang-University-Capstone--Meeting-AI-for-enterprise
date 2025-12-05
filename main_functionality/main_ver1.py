@@ -8,13 +8,12 @@ from dotenv import load_dotenv
 import struct
 import math
 import asyncio
+import json
 
 # [AI 라이브러리]
 from faster_whisper import WhisperModel
-from sentence_transformers import SentenceTransformer, util
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-from keybert import KeyBERT
-from huggingface_hub import hf_hub_download, list_repo_files
+from google import genai
+from google.genai import types
 
 # [화자 분리 라이브러리]
 from pyannote.audio import Model
@@ -27,6 +26,7 @@ from tqdm import tqdm
 # 토큰 불러오기
 load_dotenv()
 HF_TOKEN = os.getenv("HF_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # TF32 가속
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -35,9 +35,10 @@ torch.backends.cudnn.allow_tf32 = True
 # 설정값
 DEVICE_INDEX = 1  # 장치 번호
 SAMPLE_RATE = 16000
-BUFFER_SIZE = 4  # 묶어서 요약할 문장 수
-FLOW_THRESHOLD = 0.3  # 주제 유사도 임계값
+BUFFER_SIZE = 6  # 묶어서 요약할 문장 수
+FLOW_THRESHOLD = 3  # 주제 유사도 임계값
 WHISPER_MODEL_SIZE = "medium"  # Whisper 모델 크기 (small, medium, large-v3)
+GEMINI_MODEL_NAME = "gemini-2.5-flash"
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.dirname(CURRENT_DIR)
@@ -53,19 +54,13 @@ MIN_AUDIO_LEN = 0.8  # 최소 몇초 이상 말해야하는지
 DEVICE = "cuda"
 COMPUTE_TYPE = "float16"
 
-
-
 # 모델 다운로드하는 함수
-def download_model_local(repo_id, local_dir, is_whisper=False):
-    model_name = repo_id.split("/")[-1]
-    print(f"\n 다운로드 체크: {model_name}")
+def download_model_local(repo_id, local_dir):
+    from huggingface_hub import hf_hub_download, list_repo_files
 
-    # Whisper 다운받을 때만 (모델 지정해줘야해서)
-    if is_whisper:
-        save_path = os.path.join(local_dir, f"faster-whisper-{model_name}")
-        repo_id = f"Systran/faster-whisper-{model_name}"
-    else:
-        save_path = os.path.join(local_dir, model_name)
+    model_name = repo_id
+    save_path = os.path.join(local_dir, f"faster-whisper-{model_name}")
+    repo_id = f"Systran/faster-whisper-{model_name}"
 
     # 로컬에 있는지 확인용
     if os.path.exists(save_path) and len(os.listdir(save_path)) > 0:
@@ -73,27 +68,20 @@ def download_model_local(repo_id, local_dir, is_whisper=False):
         return save_path
 
     # 폴더 파일 확인
+    os.makedirs(save_path, exist_ok=True)
     try:
-        os.makedirs(save_path, exist_ok=True)
         files = list_repo_files(repo_id)
-        target_files = [f for f in files if
-                        f.endswith(".bin") or f.endswith(".json") or f.endswith(".txt") or f.endswith(
-                            ".safetensors") or f.endswith(".yaml")]
-    except Exception as e:
-        print(f"[ERROR] 파일 목록 조회 실패: {e}")
-        return save_path
-
-    # 모델 다운로드
-    for filename in tqdm(target_files, desc=f"다운로드 중: {model_name}", unit="file"):
-        try:
+        target_files = [f for f in files if f.endswith((".bin", ".json", ".txt"))]
+        # 모델 다운로드
+        for filename in tqdm(target_files, desc=f"다운로드 중: {model_name}", unit="file"):
             hf_hub_download(
                 repo_id=repo_id,
                 filename=filename,
                 local_dir=save_path,
                 local_dir_use_symlinks=False
             )
-        except:
-            pass
+    except Exception as e:
+        print(f"[ERROR] 모델 다운로드 오류: {e}")
     return save_path
 
 
@@ -105,40 +93,18 @@ class MeetingAssistant:
         print("환경:", DEVICE)
         print("--------------------------------------------------")
 
+        # Gemini 연결
+        print(f"LLM Gemini {GEMINI_MODEL_NAME} 연결")
+        self.client = genai.Client(api_key=GEMINI_API_KEY)
+        
         # Whisper 모델
         print(f"STT 모델(Whisper {WHISPER_MODEL_SIZE}) 로드")
         try:
-            model_path = download_model_local(WHISPER_MODEL_SIZE, MODELS_DIR, is_whisper=True)
+            model_path = download_model_local(WHISPER_MODEL_SIZE, MODELS_DIR)
             self.stt_model = WhisperModel(model_path, device=DEVICE, compute_type=COMPUTE_TYPE)
             print("Whisper 로드 완료")
         except Exception as e:
             print(f"Whisper 로드 실패: {e}")
-            sys.exit(1)
-
-        # 요약모델 로드
-        print("요약 모델(T5) 로드")
-        try:
-            repo_id = "eenzeenee/t5-base-korean-summarization"
-            model_path = download_model_local(repo_id, MODELS_DIR)
-            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-            self.summarizer = AutoModelForSeq2SeqLM.from_pretrained(model_path).to(DEVICE)
-            print("요약 모델(T5) 로드 완료")
-        except Exception as e:
-            print(f"요약 모델(T5) 로드 실패: {e}")
-            sys.exit(1)
-
-        # 판별모델 로드
-        print("판별 모델(SBERT) 로드")
-        try:
-            repo_id = "kimseongsan/ko-sbert-384-reduced"
-            model_path = download_model_local(repo_id, MODELS_DIR)
-            self.sbert = SentenceTransformer(model_path)
-            self.kw_model = KeyBERT(model=self.sbert)
-            # self.todo_anchors = ["제가 하겠습니다.", "부탁드립니다.", "일정 잡읍시다."]
-            # self.todo_embeddings = self.sbert.encode(self.todo_anchors, convert_to_tensor=True)
-            print("판별 모델(SBERT) 로드 완료")
-        except Exception as e:
-            print(f"판별 모델(SBERT) 로드 실패: {e}")
             sys.exit(1)
 
         # 화자 임베딩 모델
@@ -158,13 +124,12 @@ class MeetingAssistant:
         print("모든 모델 로드 완료")
         print("--------------------------------------------------\n")
 
+        # 상태 변수
         self.is_running = True
-        self.transcript_buffer = []
-        self.full_transcript = []
-        self.section_summaries = []
-        # self.todo_list = []
+        self.transcript_buffer = [] # Gemini 전송용 버퍼
+        self.full_transcript = [] # 전체 대화 저장
+        self.analysis_logs = [] # Gemini 분석 결과 저장
         self.meeting_topic = ""
-        self.topic_embedding = None
 
         # 화자 기억용
         self.speaker_bank = {}  # 화자 벡터 저장해놓는거
@@ -178,41 +143,17 @@ class MeetingAssistant:
         sum_squares = sum(n * n for n in [s * (1.0 / 32768.0) for s in shorts])
         return math.sqrt(sum_squares / count) * 10000
 
-    # Sync 함수들 asyncio로 실행될것들
+    # --------------------------------- 동기 실행용 ----------------------------------------
+
     # Whisper 추론함수
     def _run_whisper(self, audio_np):
         segments, _ = self.stt_model.transcribe(audio_np, beam_size=5, language="ko", condition_on_previous_text=False)
         return "".join([s.text + " " for s in segments]).strip()
 
-    # 텍스트 요약 함수
-    def _run_summarize(self, text):
-        input_text = "summarize: " + text
-        inputs = self.tokenizer(input_text, max_length=1024, truncation=True, return_tensors="pt").to(DEVICE)
-        output = self.summarizer.generate(
-            **inputs,
-            max_length=150,  # 요약문 최대 길이
-            min_length=20,  # 요약문 최소 길이
-            num_beams=5,  # 탐색 폭
-            early_stopping=True,
-
-            # 같은 단어 구절 3번 이상 시 차단
-            no_repeat_ngram_size=3,
-
-            # 길이 패널티
-            length_penalty=1.2
-        )
-
-        summary = self.tokenizer.decode(output[0], skip_special_tokens=True)
-        return summary
-
-    # 판별 모델 함수
-    def _run_embedding(self, text):
-        return self.sbert.encode(text, convert_to_tensor=True)
-
     # 화자 식별 함수
     def _run_speaker_id(self, audio_np):
         try:
-            if len(audio_np) / SAMPLE_RATE < 1.0:
+            if len(audio_np) / SAMPLE_RATE < 0.5:
                 print("샘플레이트 문제")
                 return "Unknown"
 
@@ -224,12 +165,14 @@ class MeetingAssistant:
             else:
                 new_emb = embedding_result
 
+            # 화자 등록
             if not self.speaker_bank:
                 name = f"Speaker {self.speaker_counter}"
                 self.speaker_bank[name] = new_emb
                 self.speaker_counter += 1
                 return name
-
+            
+            # 화자 비교
             min_dist = 100.0
             best_match = None
             for name, saved_emb in self.speaker_bank.items():
@@ -245,92 +188,127 @@ class MeetingAssistant:
                 self.speaker_bank[new_name] = new_emb
                 self.speaker_counter += 1
                 return new_name
-        except:
-            return "Unknown"
-
-    # Async 처리용
-    # 요약, 분석 함수
-    async def analyze_task(self, text_chunk):
-        try:
-            # 1. 요약
-            summary = await asyncio.to_thread(self._run_summarize, text_chunk)
-            now = datetime.datetime.now().strftime("%H:%M")
-            self.section_summaries.append(f"[{now}] {summary}")
-            print(f"\n[Summary] {summary}\n")
-
-            # 2. 논점 체크
-            if self.topic_embedding is not None:
-                emb = await asyncio.to_thread(self._run_embedding, summary)
-                score = util.cos_sim(self.topic_embedding, emb).item()
-
-                if score < FLOW_THRESHOLD:
-                    print(f"\n[Warning] 논점 이탈 감지 (유사도: {score:.2f})")
         except Exception as e:
-            print(f"분석 에러: {e}")
+            print(f"화자 식별 오류: {e}")
+            return "Unknown"
+    
+    # Gemini 요약, 결정사항, 주제 이탈 여부 요청 함수
+    def _run_gemini_analysis(self, text_chunk, main_topic):
+        prompt = f"""
+        당신은 꼼꼼한 회의 서기입니다.
+        현재 회의의 메인 주제는 "{main_topic}"입니다.
+        아래 입력된 회의 스크립트 조각을 분석하여 다음 JSON 형식으로만 응답하세요. (마크다운 태그 없이 순수 JSON만 출력)
 
-    # 오디오 처리 파이프라인 (STT -> 화자 분리 -> 요약)
+        [입력 텍스트]
+        {text_chunk}
+
+        [분석 가이드]
+        1. summary: 대화 내용을 1~2문장으로 명확히 요약하세요.
+        2. decisions: "하기로 했다", "결정했다", "그렇게 합시다" 등 합의된 결정 사항이 있다면 명시하세요. (없으면 빈 리스트 [])
+        3. off_topic_score: 메인 주제("{main_topic}")와 현재 대화의 관련성을 0~10점으로 평가하세요. (0: 완전 무관, 10: 주제 그 자체)
+        4. todos: "(담당자) 할일 내용" 형태로 구체적인 액션 아이템을 추출하세요.
+
+        [출력 형식 (JSON)]
+        {{
+            "summary": "요약 내용...",
+            "decisions": ["결정사항1", "결정사항2"],
+            "off_topic_score": 9,
+            "todos": ["(김철수) 리포트 작성", "(이영희) 서버 점검"]
+        }}
+        """
+
+        try:
+            # 요청 응답
+            response = self.client.models.generate_content(
+                model=GEMINI_MODEL_NAME,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json"
+                )
+            )
+
+            # JSON 파싱 전처리
+            clean_text = response.text.strip()
+            if clean_text.startswith("```json"):
+                clean_text = clean_text[7:]
+            if clean_text.endswith("```"):
+                clean_text = clean_text[:-3]
+            return json.loads(clean_text)
+
+        except Exception as e:
+            print(f"[Gemini Error] {e}")
+            return None
+
+    # --------------------------------- 비동기 실행용 ----------------------------------------
+    async def analyze_task(self, full_text):
+        result = await asyncio.to_thread(self._run_gemini_analysis, full_text, self.meeting_topic)
+
+        if result:
+            now = datetime.datetime.now().strftime("%H:%M")
+            
+            # 로그 저장
+            log_entry = {
+                "time": now,
+                "summary": result.get("summary", ""),
+                "decisions": result.get("decisions", []),
+                "off_topic_score": result.get("off_topic_score", 10),
+                "todos": result.get("todos", [])
+            }
+            self.analysis_logs.append(log_entry)
+
+            print(f"요약: {log_entry['summary']}")
+
+            if log_entry['decisions']:
+                print(f"결정사항: {', '.join(log_entry['decisions'])}")
+
+            if log_entry['todos']:
+                print(f"할일: {', '.join(log_entry['todos'])}")
+
+            # 주제 이탈 경고
+            score = log_entry['off_topic_score']
+            if score < FLOW_THRESHOLD:
+                print(f"[Warning] 논점 이탈 감지 (유사도: {score}/10)")
+
+    # 오디오 처리 파이프라인 (STT -> 화자 분리 -> 요약 -> 분석)
     async def process_audio(self, audio_np):
         try:
             # 1. Whisper 실행
             text_chunk = await asyncio.to_thread(self._run_whisper, audio_np)
+            # 텍스트가 없거나 너무 짧으면 패스
+            if not text_chunk or len(text_chunk) < 2: return 
             
             # 중복방지
-            last_text = self.transcript_buffer[-1] if self.transcript_buffer else ""
+            if self.full_transcript:
+                last_log = self.full_transcript[-1]
+                if "]" in last_log:
+                    last_text_content = last_log.split("]", 1)[1].strip()
+                    if text_chunk == last_text_content:
+                        return
 
-            if text_chunk and text_chunk != last_text:
-                # 2. 화자 식별
-                speaker = await asyncio.to_thread(self._run_speaker_id, audio_np)
-                log_text = f"[{speaker}] {text_chunk}"
-                print(f"   {log_text}")
+            # 2. 화자 식별
+            speaker = await asyncio.to_thread(self._run_speaker_id, audio_np)
+            
+            # 3. 로그 출력
+            log_text = f"[{speaker}] {text_chunk}"
+            print(f"   {log_text}")
 
-                self.full_transcript.append(log_text)
-                self.transcript_buffer.append(text_chunk)
+            self.full_transcript.append(log_text)
+            self.transcript_buffer.append(text_chunk)
 
-                # 3. 요약 조건 충족 시
-                if len(self.transcript_buffer) >= BUFFER_SIZE:
-                    full_text = " ".join(self.transcript_buffer)
-                    self.transcript_buffer = []
-                    # 4. 분석 작업을 백그라운드 태스크로
-                    asyncio.create_task(self.analyze_task(full_text))
+            # 4. 요약 조건 충족 시
+            if len(self.transcript_buffer) >= BUFFER_SIZE:
+                full_text = "\n".join(self.transcript_buffer)
+                self.transcript_buffer = []
+                # 5. 분석 작업을 백그라운드 태스크로
+                asyncio.create_task(self.analyze_task(full_text))
 
         except Exception as e:
             print(f"처리 에러: {e}")
 
-    # 리포트 저장용 함수
-    def save_report(self):
-        print("\n--------------------------------------------------")
-        print("리포트 생성")
-        print("--------------------------------------------------")
-
-        full_text = " ".join(self.full_transcript)
-        keywords = self.kw_model.extract_keywords(full_text, keyphrase_ngram_range=(1, 2), stop_words=None, top_n=5)
-
-        report = []
-        report.append(f"주제: {self.meeting_topic}\n")
-        report.append("[키워드]")
-        for kw, score in keywords: report.append(f"- {kw}")
-        # report.append("\n[할 일]")
-        # if self.todo_list:
-        #     for t in self.todo_list: report.append(f"- {t}")
-        # else:
-        #     report.append("- 없음")
-        report.append("\n[요약]")
-        for s in self.section_summaries: report.append(f"- {s}")
-
-        content = "\n".join(report)
-        print(content)
-
-        if not os.path.exists(LOGS_DIR): os.makedirs(LOGS_DIR)
-        filename = f"meeting_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.txt"
-        path = os.path.join(LOGS_DIR, filename)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-        print(f"\n저장 완료: {path}")
-
-    # 메인 시작 함수
+    # --------------------------------- 메인 ----------------------------------------
     async def start(self):
         self.meeting_topic = input("회의 주제: ")
-        self.topic_embedding = await asyncio.to_thread(self._run_embedding, self.meeting_topic)
+        if not self.meeting_topic: self.meeting_topic = "일반 회의"
 
         # 0.1초 단위로 쪼개서 감시
         CHUNK = int(SAMPLE_RATE * 0.1)
@@ -394,27 +372,65 @@ class MeetingAssistant:
                             # 버퍼 초기화
                             audio_buffer = []
                             silence_chunks = 0
+
                 # 루프간 간격
                 await asyncio.sleep(0.001)
 
             except KeyboardInterrupt:
                 break
-            except Exception:
+            except Exception as e:
+                print(f"스트림 에러: {e}")
                 continue
 
         # 종료 처리
+        self._cleanup()
+
+    # --------------------------------- 종료시 ----------------------------------------
+    # 내부 초기화
+    def _cleanup(self):
         print("\n종료 중...")
         self.is_running = False
-        if self.stream:
+        if hasattr(self, 'stream'):
             self.stream.stop_stream()
             self.stream.close()
         self.p.terminate()
         self.save_report()
 
+        # 리포트 저장용 함수
+    def save_report(self):
+        print("\n--------------------------------------------------")
+        print("리포트 생성")
+        print("--------------------------------------------------")
+
+        if not os.path.exists(LOGS_DIR): os.makedirs(LOGS_DIR)
+
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M')
+        filename = f"meeting_report_{timestamp}.txt"
+        path = os.path.join(LOGS_DIR, filename)
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"회의 주제: {self.meeting_topic}\n")
+            f.write(f"일시: {timestamp}\n")
+            f.write("-" * 50 + "\n\n")
+
+            f.write("[AI 요약 및 분석]\n")
+            for log in self.analysis_logs:
+                f.write(f"[{log['time']}]\n")
+                f.write(f"- 요약: {log['summary']}\n")
+                if log['decisions']: f.write(f"- 결정: {', '.join(log['decisions'])}\n")
+                if log['todos']: f.write(f"- 할일: {', '.join(log['todos'])}\n")
+                f.write(f"- 주제관련도: {log['off_topic_score']}/10\n\n")
+
+            f.write("-" * 50 + "\n")
+            f.write("[전체 대화 로그]\n")
+            for line in self.full_transcript:
+                f.write(f"{line}\n")
+
+        print(f"저장 완료: {path}")
 
 if __name__ == "__main__":
     assistant = MeetingAssistant()
     try:
         asyncio.run(assistant.start())
     except KeyboardInterrupt:
-        pass
+        assistant._cleanup()

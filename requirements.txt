@@ -7,9 +7,6 @@ streamlit
 
 # --- AI & NLP Core ---
 faster-whisper
-sentence-transformers
-transformers
-keybert
 
 # --- Audio Input ---
 pyaudio
@@ -26,3 +23,6 @@ torchaudio==2.8.0
 # 버전문제 수정
 lightning==2.5.6
 pytorch-lightning==2.5.6
+
+# LLM
+google-genai
