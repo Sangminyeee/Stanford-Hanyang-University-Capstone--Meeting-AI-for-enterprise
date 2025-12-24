@@ -86,14 +86,10 @@ GOOGLE_API_KEY="asdf1234"
 
 
 ### 의존성 설치
-```uv pip install -r requirements.txt --index-url https://pypi.org/simple```
-
-or
-
-```pip install -r requirements.txt```
+```uv sync```
 
 ### 웹뷰용 실행
 ```streamlit run web_view_test/webview_vibe_ver1.py```
 
 ### 코드용 실행
-```uv run .\main_functionality\main_ver1.py```
+```uv run .\main_function_ver2\코드.py```

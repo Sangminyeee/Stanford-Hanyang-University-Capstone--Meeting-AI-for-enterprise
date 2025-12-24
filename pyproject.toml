@@ -1,6 +1,39 @@
 [project]
 name = "stanford-hanyang-university-capstone-meeting-ai-for-enterprise"
 version = "0.1.0"
-description = "Add your description here"
+description = "AI & NLP project with CUDA 12.9 using uv"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "tqdm",
+    "python-dotenv",
+    "numpy",
+    "huggingface-hub",
+    "streamlit",
+    "faster-whisper",
+    "openai-whisper",
+    "pyaudio",
+    "pyannote-audio",
+    "lightning==2.5.6",
+    "pytorch-lightning==2.5.6",
+    "google-genai",
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    "torchaudio==2.8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[[tool.uv.index]]
+name = "pytorch_cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch_cu129" }
+torchvision = { index = "pytorch_cu129" }
+torchaudio = { index = "pytorch_cu129" }
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
