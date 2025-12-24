@@ -1,0 +1,6 @@
+[project]
+name = "stanford-hanyang-university-capstone-meeting-ai-for-enterprise"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = []

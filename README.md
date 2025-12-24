@@ -1,38 +1,99 @@
-URL: https://stanford-hanyang-university-capstone-meeting-ai-for-dtdlc4rt6.vercel.app
+<div align="center">
 
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# 🎓 Stanford University Capstone  
+## **Enterprise AI Meeting Facilitation System**
 
-## Getting Started
+### _AI-powered platform for real-time meeting analysis, cognitive load monitoring, and enhanced communication efficiency._
 
-First, run the development server:
+</div>
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+---
+
+## ✨ Overview
+
+This project develops an **enterprise-grade AI meeting facilitation system** that analyzes:
+
+- 🗣 **Speaking patterns & participation balance**  
+- 🧠 **Cognitive load signals**  
+- 🧵 **Topic flow & drift detection**  
+- 📊 **Post-meeting analytics**
+
+The system integrates three major layers:
+
+1. **Hardware Layer** – Edge device, sensors, audio capture  
+2. **AI Layer** – STT, diarization, topic modeling, metric extraction  
+3. **Web Layer** – Real-time feedback dashboard + analytics interface  
+
+Documentation contains architectural design, planning logs, and research notes.
+
+---
+
+## 📁 Project Structure
+
+```plaintext
+/src
+   /hardware
+        - Edge device & audio preprocessing
+        - Sensor integration
+        - Microcontroller (e.g., Raspberry Pi, Arduino) code
+
+   /web
+        - Live meeting feedback UI
+        - Analytics dashboard
+        - Backend API integration
+
+   /ai
+        - Whisper / Deepgram STT pipeline
+        - Speaker diarization
+        - Topic drift detection
+        - Meeting metrics & AI models
+
+/docs
+   - System architecture diagrams
+   - UX/UI design & wireframes
+   - Research notes & literature review
+   - Meeting logs & planning documents
+
+/tests
+   - Unit tests
+   - Integration tests
+   - Experimental scripts
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## AI readme temp
+### 사전 준비
+프로젝트 폴더에 .env 파일 생성
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+- 화자분리용
+  1. 허깅페이스 가입
+  2. 모델 사용 동의
+     - https://huggingface.co/pyannote/segmentation-3.0
+     - https://huggingface.co/pyannote/speaker-diarization-3.1
+  3. read 권한으로 access 토큰 발급
+  4. .env 파일에 HF_TOKEN =  작성하고 위 발급받은 토큰 붙여넣기
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+-  Gemini API
+  1. https://aistudio.google.com/api-keys 접속
+     2. API 키 만들기
+     3. .env 파일에 GOOGLE_API_KEY =  작성하고 위 발급받은 토큰 붙여넣기
 
-## Learn More
+.env 파일 내부는 아래와 같아야함
+```
+HF_TOKEN="asdf1234"
+GOOGLE_API_KEY="asdf1234"
+```
 
-To learn more about Next.js, take a look at the following resources:
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+### 의존성 설치
+```uv pip install -r requirements.txt --index-url https://pypi.org/simple```
 
-## Deploy on Vercel
+or
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```pip install -r requirements.txt```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+### 웹뷰용 실행
+```streamlit run web_view_test/webview_vibe_ver1.py```
+
+### 코드용 실행
+```uv run .\main_functionality\main_ver1.py```
