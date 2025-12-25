@@ -6,13 +6,9 @@ import datetime
 import torch
 import json
 import asyncio
-import math
-import struct
 from dotenv import load_dotenv
 import whisper
 import threading
-import time
-import queue
 from huggingface_hub import login
 from rx.core import Observer
 import wave
@@ -50,10 +46,6 @@ BUFFER_SIZE = 6  # 분석을 위해 모으는 문장 개수
 WHISPER_MODEL_SIZE = "turbo" # 모델
 GEMINI_MODEL_NAME = "gemini-3-flash-preview" # 제미니 모델
 
-# VAD (음성 감지) 설정
-SILENCE_THRESHOLD = 500
-SILENCE_DURATION = 0.5
-MIN_AUDIO_LEN = 0.3
 
 # 경로 설정
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -186,6 +178,10 @@ class MeetingAssistant:
         self.segment_index_path = os.path.join(self.audio_segments_dir, "segments.jsonl")
         self._segment_seq = 0
 
+        # diart segment 중복 STT 방지
+        self._last_processed_end = 0.0
+        self._last_processed_lock = threading.Lock()
+
     # 전사 전 음성 파일 저장용
     def _save_segment_wav(self, seg_audio: np.ndarray, speaker: str, abs_start: float, abs_end: float) -> str:
         self._segment_seq += 1
@@ -204,13 +200,6 @@ class MeetingAssistant:
             wf.writeframes(pcm16.tobytes())
 
         return wav_path
-
-    # 소리 크기 계산
-    def get_rms(self, data):
-        count = len(data) // 2
-        shorts = struct.unpack("%dh" % count, data)
-        sum_squares = sum(n * n for n in [s * (1.0 / 32768.0) for s in shorts])
-        return math.sqrt(sum_squares / count) * 10000
 
     # -------------------- [Thread] AI 처리 함수들 --------------------
     # Whisper STT
@@ -306,6 +295,10 @@ class MeetingAssistant:
                 # 오디오 세그먼트 저장
                 abs_start = float(segment.start)
                 abs_end = float(segment.end)
+                with self._last_processed_lock:
+                    if abs_end <= self._last_processed_end + 0.05:
+                        continue
+
                 wav_path = self._save_segment_wav(seg_audio, speaker, abs_start, abs_end)
 
                 if not text:
@@ -321,6 +314,10 @@ class MeetingAssistant:
                 }
                 with open(self.segment_index_path, "a", encoding="utf-8") as jf:
                     jf.write(json.dumps(meta, ensure_ascii=False) + "\n")
+
+                with self._last_processed_lock:
+                    if abs_end > self._last_processed_end:
+                        self._last_processed_end = abs_end
 
                 log_text = f"[{speaker}] {text}"
                 with self._transcript_lock:
@@ -401,39 +398,6 @@ class MeetingAssistant:
                 print(f"할일: {', '.join(log_entry['todos'])}")
             print(" -----------------------------------------\n")
 
-    # 오디오 프로세스 파이프라인 (Diart(화자구분) -> STT(Whisper))
-    # Diart로 화자분리하려면 audio chunk를 diart 소스로 push해야함
-    # STT -> 화자식별 이었던 기존에서 diart에서 분리한 구간을 받아 whisper로 전사하도록 개조
-    async def process_audio(self, audio_np):
-        if audio_np is None:
-            print("[DBG] audio_np is None")
-            return
-        print("[DBG] process_audio len(sec)=", len(audio_np) / SAMPLE_RATE)
-
-        try:
-            # 최소 길이 체크
-            if audio_np is None or len(audio_np) / SAMPLE_RATE < 0.2:
-                return
-
-            # diart에 waveform push (float32, -1..1)
-            try:
-                if hasattr(self, 'diar_source'):
-                    self.diar_source.push_audio(audio_np)
-                    print("[DBG] pushed to diar_source")
-                else:
-                    # diart가 없다면 기존 동작: Whisper 바로 실행 + 임시 스피커 id
-                    text_chunk = await asyncio.to_thread(self._run_whisper, audio_np)
-                    if not text_chunk or len(text_chunk) < 2: return
-                    speaker = "Unknown"
-                    log_text = f"[{speaker}] {text_chunk}"
-                    with self._transcript_lock:
-                        self.full_transcript.append(log_text)
-                        self.transcript_buffer.append(log_text)
-            except Exception as e:
-                print(f"diart push error: {e}")
-        except Exception as e:
-            print(f"process_audio 에러: {e}")
-
     # -------------------- 메인 루프 --------------------
     async def start(self):
         self.meeting_topic = input("\n회의 주제를 입력하세요: ")
@@ -463,32 +427,17 @@ class MeetingAssistant:
 
         print(f"\n녹음 시작: '{self.meeting_topic}' (Ctrl+C로 종료)\n")
 
-        audio_buffer = []
-        silence_chunks = 0
-        is_speaking = False
 
         while self.is_running:
             try:
                 data = self.stream.read(CHUNK, exception_on_overflow=False)
-                rms = self.get_rms(data)
 
-                # VAD 로직
-                if rms > SILENCE_THRESHOLD:
-                    is_speaking = True
-                    silence_chunks = 0
-                    audio_buffer.append(data)
-                else:
-                    if is_speaking:
-                        audio_buffer.append(data)
-                        silence_chunks += 1
-                        if silence_chunks * 0.1 > SILENCE_DURATION:
-                            is_speaking = False
-                            if len(audio_buffer) * 0.1 >= MIN_AUDIO_LEN:
-                                full_audio = b''.join(audio_buffer)
-                                audio_np = np.frombuffer(full_audio, dtype=np.int16).astype(np.float32) / 32768.0
-                                asyncio.create_task(self.process_audio(audio_np))
-                            audio_buffer = []
-                            silence_chunks = 0
+                # int16 PCM -> float32 [-1, 1]
+                audio_np = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+
+                # 기존 VAD 대신 바로 diart로 넘기기
+                self.diar_source.push_audio(audio_np)
+
                 await asyncio.sleep(0.001)
 
             except KeyboardInterrupt:
