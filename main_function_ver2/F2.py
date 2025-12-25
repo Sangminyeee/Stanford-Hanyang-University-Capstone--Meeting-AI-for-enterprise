@@ -404,8 +404,6 @@ class MeetingAssistant:
             return
         print("[DBG] process_audio len(sec)=", len(audio_np) / SAMPLE_RATE)
 
-        self.diar_source.push_audio(audio_np)
-        print("[DBG] pushed to diar_source")
         try:
             # 최소 길이 체크
             if audio_np is None or len(audio_np) / SAMPLE_RATE < 0.2:
@@ -415,6 +413,7 @@ class MeetingAssistant:
             try:
                 if hasattr(self, 'diar_source'):
                     self.diar_source.push_audio(audio_np)
+                    print("[DBG] pushed to diar_source")
                 else:
                     # diart가 없다면 기존 동작: Whisper 바로 실행 + 임시 스피커 id
                     text_chunk = await asyncio.to_thread(self._run_whisper, audio_np)
