@@ -15,6 +15,7 @@ import time
 import queue
 from huggingface_hub import login
 from rx.core import Observer
+import wave
 
 # Gemini API
 from google import genai
@@ -171,6 +172,33 @@ class MeetingAssistant:
         self.speaker_counter = 1
         self.SPEAKER_SIMILARITY_THRESHOLD = 0.6
 
+        # --- STT에 사용된 오디오 세그먼트 저장용 ---
+        self.audio_segments_dir = os.path.join(LOGS_DIR, "segments")
+        os.makedirs(self.audio_segments_dir, exist_ok=True)
+
+        # 세그먼트 메타데이터는 JSONL로 누적 기록
+        self.segment_index_path = os.path.join(self.audio_segments_dir, "segments.jsonl")
+        self._segment_seq = 0
+
+    # 전사 전 음성 파일 저장용
+    def _save_segment_wav(self, seg_audio: np.ndarray, speaker: str, abs_start: float, abs_end: float) -> str:
+        self._segment_seq += 1
+        seg_id = f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{self._segment_seq:06d}"
+        wav_name = f"{seg_id}__{speaker}__{abs_start:.2f}-{abs_end:.2f}.wav"
+        wav_path = os.path.join(self.audio_segments_dir, wav_name)
+
+        x = np.asarray(seg_audio, dtype=np.float32)
+        x = np.clip(x, -1.0, 1.0)
+        pcm16 = (x * 32767.0).astype(np.int16)
+
+        with wave.open(wav_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # int16
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(pcm16.tobytes())
+
+        return wav_path
+
     # 소리 크기 계산
     def get_rms(self, data):
         count = len(data) // 2
@@ -269,8 +297,24 @@ class MeetingAssistant:
                 # Whisper 보내기 위한 포맷 변환
                 text = self._run_whisper(seg_audio)
 
+                # 오디오 세그먼트 저장
+                abs_start = float(segment.start)
+                abs_end = float(segment.end)
+                wav_path = self._save_segment_wav(seg_audio, speaker, abs_start, abs_end)
+
                 if not text:
                     continue
+
+                meta = {
+                    "time": datetime.datetime.now().isoformat(),
+                    "speaker": speaker,
+                    "segment_start": abs_start,
+                    "segment_end": abs_end,
+                    "wav_path": wav_path,
+                    "text": text,
+                }
+                with open(self.segment_index_path, "a", encoding="utf-8") as jf:
+                    jf.write(json.dumps(meta, ensure_ascii=False) + "\n")
 
                 log_text = f"[{speaker}] {text}"
                 with self._transcript_lock:
