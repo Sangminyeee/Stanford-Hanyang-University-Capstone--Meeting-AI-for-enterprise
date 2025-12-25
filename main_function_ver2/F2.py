@@ -22,7 +22,7 @@ from google import genai
 from google.genai import types
 
 # 화자 분리용 diart
-from diart import SpeakerDiarization
+from diart import SpeakerDiarization, SpeakerDiarizationConfig
 from diart.inference import StreamingInference
 from diart.sources import AudioSource
 from pyannote.core import SlidingWindowFeature
@@ -136,7 +136,13 @@ class MeetingAssistant:
         # 3. 화자 식별 모델 로드
         print(" [Local] diart SpeakerDiarization 파이프라인 로드 중...")
         try:
-            self.diar_pipeline = SpeakerDiarization()
+            config = SpeakerDiarizationConfig(
+                # Set the segmentation model used in the paper
+                device=DEVICE,
+                sample_rate=SAMPLE_RATE,
+            )
+
+            self.diar_pipeline = SpeakerDiarization(config)
             # push 소스 생성
             self.diar_source = PushAudioSource(sample_rate=SAMPLE_RATE)
             self.diar_inference = StreamingInference(
