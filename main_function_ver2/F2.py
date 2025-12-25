@@ -14,6 +14,7 @@ import threading
 import time
 import queue
 from huggingface_hub import login
+from rx.core import Observer
 
 # Gemini API
 from google import genai
@@ -57,6 +58,17 @@ MIN_AUDIO_LEN = 0.3
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGS_DIR = os.path.join(CURRENT_DIR, "../log")
 
+# -------------------- 디버그용 클래스 --------------------
+class DebugObserver(Observer):
+    def on_next(self, value):
+        print("[DBG] observer on_next (diart emitted)")
+
+    def on_error(self, error):
+        print("[DBG] observer on_error:", repr(error))
+
+    def on_completed(self):
+        print("[DBG] observer on_completed")
+        
 # -------------------- 오디오 주입 클래스 --------------------
 # numpy waveform을 push_audio()로 주입하면 diart의 StreamingInference가 read()로 블록된 상태에서도 stream을 통해 데이터 수신
 class PushAudioSource(AudioSource):
@@ -73,11 +85,10 @@ class PushAudioSource(AudioSource):
             return
 
         wav = np.asarray(waveform, dtype=np.float32)
-        print("[DBG] on_next", wav.shape)
 
         # diart 관례: (channels, samples)
         if wav.ndim == 1:
-            wav = np.expand_dims(wav, axis=0)  # (1, N)
+            wav = wav[None, :]
         elif wav.ndim == 2:
             # (N,1) -> (1,N)로 정규화
             if wav.shape[1] == 1 and wav.shape[0] != 1:
@@ -86,7 +97,6 @@ class PushAudioSource(AudioSource):
             if wav.shape[0] > 1:
                 wav = wav[:1, :]
 
-        # 핵심: rx subject로 흘려보내기
         self.stream.on_next(wav)
 
     def close(self):
@@ -136,6 +146,7 @@ class MeetingAssistant:
             )
             # 다이얼 결과 수신용
             self.diar_inference.attach_hooks(self._diar_hook)
+            self.diar_inference.attach_observers(DebugObserver())
             print("다이얼 인퍼런스")
             # inference를 백그라운드 스레드로 실행
             threading.Thread(target=self._run_diar_inference, daemon=True).start()
@@ -179,17 +190,22 @@ class MeetingAssistant:
 
     # 화자 분리
     def _run_diar_inference(self):
+        print("[DBG] diar inference thread started")
         try:
             # self.diar_source.read()를 호출하고
             # self.diar_source.stream에서 데이터가 emit 되면 pipeline이 처리
             self.diar_inference()
         except Exception as e:
             print(f"[DiarInference Error] {e}")
+        finally:
+            print("[DBG] diar inference thread exited")
 
     # diart에서 받은 화자 분리된 발화 구간들 whisper로 전사 후 분석
     def _diar_hook(self, result):
+        print("[DBG] _diar_hook called")
         try:
             annotation, ann_wav = result
+            print("[DBG] ann_wav type:", type(ann_wav))
         except Exception:
             return
 
