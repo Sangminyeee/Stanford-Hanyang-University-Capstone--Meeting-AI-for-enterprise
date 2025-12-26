@@ -12,6 +12,7 @@ import threading
 from huggingface_hub import login
 from rx.core import Observer
 import wave
+from collections import deque
 
 # Gemini API
 from google import genai
@@ -46,6 +47,14 @@ BUFFER_SIZE = 6  # 분석을 위해 모으는 문장 개수
 WHISPER_MODEL_SIZE = "turbo" # 모델
 GEMINI_MODEL_NAME = "gemini-3-flash-preview" # 제미니 모델
 
+# VAD 설정
+VAD_THRESHOLD = 0.5 # 소리 임계값
+VAD_MIN_SILENCE_MS = 500 # 침묵시간
+VAD_SPEECH_PAD_MS = 120 # 발화 패딩 (가끔 말 시작하고 좀 늦게 감지할때가 있어서)
+
+MIN_UTT_SEC = 0.6 # 최소 한 문장 길이
+MAX_UTT_SEC = 25.0 # 최대 한 문장 길이
+DBG_STT = True
 
 # 경로 설정
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -154,6 +163,33 @@ class MeetingAssistant:
         except Exception as e:
             print(f"[Error] diart 로드 실패: {e}")
             sys.exit(1)
+            
+        # 4. Silero VAD 로드
+        print(" [Local] Silero VAD 로드 중...")
+        try:
+            self.vad_model, self.vad_utils = torch.hub.load(
+                repo_or_dir="snakers4/silero-vad",
+                model="silero_vad",
+                trust_repo=True
+            )
+            (self.get_speech_timestamps,
+             self.save_audio,
+             self.read_audio,
+             self.VADIterator,
+             self.collect_chunks) = self.vad_utils
+
+            self.vad_model.eval()
+            self.vad_iter = self.VADIterator(
+                self.vad_model,
+                threshold=VAD_THRESHOLD,
+                sampling_rate=SAMPLE_RATE,
+                min_silence_duration_ms=VAD_MIN_SILENCE_MS,
+                speech_pad_ms=VAD_SPEECH_PAD_MS
+            )
+            print(" >> Silero VAD 로드 완료!")
+        except Exception as e:
+            print(f"[Error] Silero VAD 로드 실패: {e}")
+            sys.exit(1)
 
         print("\n >> 모든 기능 준비 완료 <<\n")
 
@@ -181,6 +217,25 @@ class MeetingAssistant:
         # diart segment 중복 STT 방지
         self._last_processed_end = 0.0
         self._last_processed_lock = threading.Lock()
+
+        # 스트림 시간 관리(샘플 카운터)
+        self.total_samples = 0
+
+        # 발화 버퍼 상태
+        self.utt_active = False
+        self.utt_start_sample = 0
+        self.utt_buffer = []
+
+        # diart timeline 저장(화자 타임라인만)
+        self.timeline = deque(maxlen=20000)
+        self.timeline_lock = threading.Lock()
+
+        # STT 큐/워커
+        self.stt_queue = asyncio.Queue()
+        self.stt_worker_task = None
+
+        # VAD 샘플 청크 채우기용
+        self._vad_pending = np.zeros((0,), dtype=np.float32)
 
     # 전사 전 음성 파일 저장용
     def _save_segment_wav(self, seg_audio: np.ndarray, speaker: str, abs_start: float, abs_end: float) -> str:
@@ -223,7 +278,7 @@ class MeetingAssistant:
         finally:
             print("[DBG] diar inference thread exited")
 
-    # diart에서 받은 화자 분리된 발화 구간들 whisper로 전사 후 분석
+    # 변경사항: STT를 여기서 진행하는게 아니라 화자 타임라인만 누적하는걸로 변경
     def _diar_hook(self, result):
         print("[DBG] _diar_hook called")
         try:
@@ -232,106 +287,120 @@ class MeetingAssistant:
         except Exception:
             return
 
-        # waveform 탐색
-        waveform = None
-        wav_start_time = 0.0
         try:
             if isinstance(ann_wav, SlidingWindowFeature):
-                # ann_wav.data: (num_samples, num_channels?) 또는 (num_samples,) 형태일 수 있음
                 data = ann_wav.data
-                wav_start_time = float(getattr(ann_wav.sliding_window, "start", 0.0))
-                if isinstance(data, np.ndarray):
-                    if data.ndim == 2:
-                        # (N, 1) -> (N,)
-                        if data.shape[1] == 1:
-                            waveform = data[:, 0]
-                        # (1, N) -> (N,)
-                        elif data.shape[0] == 1:
-                            waveform = data[0, :]
-                        else:
-                            # 다채널이면 첫 채널만 사용(간단 처리)
-                            waveform = data[:, 0]
-                    elif data.ndim == 1:
-                        waveform = data
-            elif isinstance(ann_wav, np.ndarray):
-                # 혹시 ndarray로 올 때도 처리
-                if ann_wav.ndim == 2:
-                    waveform = ann_wav[0, :] if ann_wav.shape[0] == 1 else ann_wav[:, 0]
-                elif ann_wav.ndim == 1:
-                    waveform = ann_wav
-        except Exception:
-            waveform = None
+                sw = ann_wav.sliding_window
+                print("[DBG] ann_wav.data type:", type(data), "shape:", getattr(data, "shape", None), "ndim:",
+                      getattr(data, "ndim", None))
+                print("[DBG] sliding_window start/duration/step:", float(getattr(sw, "start", 0.0)),
+                      float(getattr(sw, "duration", 0.0)), float(getattr(sw, "step", 0.0)))
+        except Exception as e:
+            print("[DBG] ann_wav inspect error:", e)
 
-        if waveform is None:
+        items = []
+        try:
+            for segment, _track, label in annotation.itertracks(yield_label=True):
+                s = float(segment.start)
+                e = float(segment.end)
+                if e <= s:
+                    continue
+                items.append((s, e, str(label)))
+        except Exception:
             return
 
-        # annotation에서 각 발화 구간, 라벨 얻어서 Whisper로 전사 후 분석
-        try:
-            for segment, track, label in annotation.itertracks(yield_label=True):
-                speaker = str(label)
+        if not items:
+            return
+        items.sort(key=lambda x: x[0])
 
-                # segment 시간은 "전체 스트림 기준"인 경우가 많아서,
-                # 현재 chunk(ann_wav)의 시작 시간(wav_start_time) 기준으로 상대좌표로 변환해 slice
-                rel_start = float(segment.start) - wav_start_time
-                rel_end = float(segment.end) - wav_start_time
+        with self.timeline_lock:
+            for s, e, spk in items:
+                self.timeline.append((s, e, spk))
 
-                # chunk 밖으로 나가면 클램프
-                rel_start = max(0.0, rel_start)
-                rel_end = max(rel_start, rel_end)
+    # 발화구간에 대해서 화자 결정하는 함수
+    def _assign_speaker_by_overlap(self, u0: float, u1: float) -> str:
+        if u1 <= u0:
+            return "Unknown"
 
-                start_idx = int(rel_start * SAMPLE_RATE)
-                end_idx = int(rel_end * SAMPLE_RATE)
-                end_idx = min(len(waveform), end_idx)
+        with self.timeline_lock:
+            tl = list(self.timeline)
 
-                seg_audio = waveform[start_idx:end_idx]
+        scores = {}
+        for s, e, spk in tl:
+            ov = max(0.0, min(u1, e) - max(u0, s))
+            if ov > 0:
+                scores[spk] = scores.get(spk, 0.0) + ov
 
-                # 짧은 길이는 생략
-                if len(seg_audio) < int(0.2 * SAMPLE_RATE):
-                    continue
+        if not scores:
+            return "Unknown"
 
-                # Whisper 보내기 위한 포맷 변환
-                text = self._run_whisper(seg_audio)
+        best_spk = max(scores.items(), key=lambda kv: kv[1])[0]
+        best_ov = scores[best_spk]
+        if best_ov < 0.30 * (u1 - u0):
+            return "Unknown"
+        return best_spk
 
-                # 오디오 세그먼트 저장
-                abs_start = float(segment.start)
-                abs_end = float(segment.end)
-                with self._last_processed_lock:
-                    if abs_end <= self._last_processed_end + 0.05:
-                        continue
+    # 발화 구간 구분해서 오디오 반환함수
+    def _vad_process_frame(self, frame: np.ndarray):
+        x = torch.from_numpy(frame)
+        event = self.vad_iter(x)
 
-                wav_path = self._save_segment_wav(seg_audio, speaker, abs_start, abs_end)
+        if DBG_STT:
+            # 입력 sanity: 길이/진폭
+            m = float(np.max(np.abs(frame))) if len(frame) else 0.0
+            print(f"[DBG] VAD in: len={len(frame)} max_abs={m:.4f} total_samples={self.total_samples}")
 
-                if not text:
-                    continue
+        print("[DBG] VAD raw event:", event)
 
-                meta = {
-                    "time": datetime.datetime.now().isoformat(),
-                    "speaker": speaker,
-                    "segment_start": abs_start,
-                    "segment_end": abs_end,
-                    "wav_path": wav_path,
-                    "text": text,
-                }
-                with open(self.segment_index_path, "a", encoding="utf-8") as jf:
-                    jf.write(json.dumps(meta, ensure_ascii=False) + "\n")
+        # 발화 중인 경우에만 버퍼 누적
+        if event is None:
+            if self.utt_active:
+                self.utt_buffer.append(frame)
+            return None
 
-                with self._last_processed_lock:
-                    if abs_end > self._last_processed_end:
-                        self._last_processed_end = abs_end
+        if "start" in event:
+            self.utt_active = True
+            # 현재 시작 지점 근사
+            self.utt_start_sample = max(0, self.total_samples - len(frame))
+            self.utt_buffer = [frame]
+            return None
 
-                log_text = f"[{speaker}] {text}"
-                with self._transcript_lock:
-                    self.full_transcript.append(log_text)
-                    print(f" {log_text}")
+        if "end" in event:
+            if not self.utt_active:
+                return None
+            self.utt_buffer.append(frame)
+            self.utt_active = False
 
-                # 분석 버퍼
-                self.transcript_buffer.append(log_text)
-                if len(self.transcript_buffer) >= BUFFER_SIZE:
-                    chunk_to_analyze = "\n".join(self.transcript_buffer)
-                    self.transcript_buffer = []
-                    asyncio.create_task(self.analyze_task(chunk_to_analyze))
-        except Exception as e:
-            print(f"_diar_hook 처리 에러: {e}")
+            audio = np.concatenate(self.utt_buffer, axis=0) if self.utt_buffer else None
+            self.utt_buffer = []
+            if audio is None:
+                return None
+
+            dur = len(audio) / SAMPLE_RATE
+            if dur < MIN_UTT_SEC:
+                return None
+
+            t0 = self.utt_start_sample / SAMPLE_RATE
+            t1 = self.total_samples / SAMPLE_RATE
+
+            # 너무 길면 MAX_UTT_SEC로 잘라서 여러 조각으로
+            if dur > MAX_UTT_SEC:
+                out = []
+                step = int(MAX_UTT_SEC * SAMPLE_RATE)
+                start = 0
+                while start < len(audio):
+                    end = min(len(audio), start + step)
+                    seg = audio[start:end]
+                    seg_t0 = t0 + (start / SAMPLE_RATE)
+                    seg_t1 = t0 + (end / SAMPLE_RATE)
+                    if (seg_t1 - seg_t0) >= MIN_UTT_SEC:
+                        out.append((seg, seg_t0, seg_t1))
+                    start = end
+                return out
+
+            return [(audio, t0, t1)]
+
+        return None
 
     # 요약, 흐름, 결정사항 추출
     def _run_gemini_analysis(self, text_chunk, main_topic):
@@ -373,6 +442,52 @@ class MeetingAssistant:
             return None
 
     # -------------------- [Async] 비동기 파이프라인 --------------------
+    # 큐에 발화들 STT -> 화자 결정 -> 나머지 저장 분석등 처리
+    async def _stt_worker(self):
+        print("[DBG] _stt_worker started")
+        while self.is_running:
+            item = await self.stt_queue.get()
+            if DBG_STT:
+                print("[DBG] _stt_worker got item:", None if item is None else (len(item[0]), item[1], item[2]))
+            if item is None:
+                self.stt_queue.task_done()
+                break
+                
+            audio_np, t0, t1 = item
+            text = await asyncio.to_thread(self._run_whisper, audio_np)
+            if not text:
+                self.stt_queue.task_done()
+                continue
+
+            speaker = self._assign_speaker_by_overlap(t0, t1)
+
+            # 오디오 저장용
+            wav_path = self._save_segment_wav(audio_np, speaker, t0, t1)
+            meta = {
+                "time": datetime.datetime.now().isoformat(),
+                "speaker": speaker,
+                "segment_start": float(t0),
+                "segment_end": float(t1),
+                "wav_path": wav_path,
+                "text": text,
+            }
+            with open(self.segment_index_path, "a", encoding="utf-8") as jf:
+                jf.write(json.dumps(meta, ensure_ascii=False) + "\n")
+
+            log_text = f"[{speaker}] {text}"
+            with self._transcript_lock:
+                self.full_transcript.append(log_text)
+                print(f" {log_text}")
+
+            # 분석 버퍼
+            self.transcript_buffer.append(log_text)
+            if len(self.transcript_buffer) >= BUFFER_SIZE:
+                chunk_to_analyze = "\n".join(self.transcript_buffer)
+                self.transcript_buffer = []
+                asyncio.create_task(self.analyze_task(chunk_to_analyze))
+
+            self.stt_queue.task_done()
+
     # Gemini request, 결과 출력
     async def analyze_task(self, full_text):
         result = await asyncio.to_thread(self._run_gemini_analysis, full_text, self.meeting_topic)
@@ -427,22 +542,45 @@ class MeetingAssistant:
 
         print(f"\n녹음 시작: '{self.meeting_topic}' (Ctrl+C로 종료)\n")
 
+        # STT 워커 시작
+        self.stt_worker_task = asyncio.create_task(self._stt_worker())
 
         while self.is_running:
             try:
-                data = self.stream.read(CHUNK, exception_on_overflow=False)
+                data = await asyncio.to_thread(self.stream.read, CHUNK, False)
 
                 # int16 PCM -> float32 [-1, 1]
-                audio_np = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                frame = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
 
-                # 기존 VAD 대신 바로 diart로 넘기기
-                self.diar_source.push_audio(audio_np)
+                # diart로 언제나 연속으로 넘기기
+                self.diar_source.push_audio(frame)
+
+                self._vad_pending = np.concatenate([self._vad_pending, frame], axis=0)
+
+                VAD_FRAME = 512
+                while len(self._vad_pending) >= VAD_FRAME:
+                    sub = self._vad_pending[:VAD_FRAME]
+                    self._vad_pending = self._vad_pending[VAD_FRAME:]
+
+                    # VAD로 발화 확정
+                    utts = self._vad_process_frame(sub)
+
+                    # 발화 확정되면 STT
+                    if utts:
+                        for (audio_np, t0, t1) in utts:
+                            if DBG_STT:
+                                print(f"[DBG] stt_queue.put: len={len(audio_np)} t0={t0:.3f} t1={t1:.3f}")
+                            await self.stt_queue.put((audio_np, t0, t1))
+
+                # 시간 업데이트
+                self.total_samples += VAD_FRAME
 
                 await asyncio.sleep(0.001)
 
             except KeyboardInterrupt:
                 break
-            except Exception:
+            except Exception as e:
+                print("[ERR] main loop:", repr(e))
                 continue
 
         self._cleanup()
@@ -459,6 +597,8 @@ class MeetingAssistant:
         try:
             if hasattr(self, 'diar_source'):
                 self.diar_source.close()
+            if hasattr(self, "stt_queue"):
+                asyncio.get_event_loop().create_task(self.stt_queue.put(None))
         except Exception:
             pass
         self.save_report()
