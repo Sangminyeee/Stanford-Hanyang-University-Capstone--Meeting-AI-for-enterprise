@@ -49,7 +49,7 @@ GEMINI_MODEL_NAME = "gemini-3-flash-preview" # 제미니 모델
 
 # VAD 설정
 VAD_THRESHOLD = 0.5 # 소리 임계값
-VAD_MIN_SILENCE_MS = 500 # 침묵시간
+VAD_MIN_SILENCE_MS = 400 # 침묵시간
 VAD_SPEECH_PAD_MS = 120 # 발화 패딩 (가끔 말 시작하고 좀 늦게 감지할때가 있어서)
 
 MIN_UTT_SEC = 0.6 # 최소 한 문장 길이
@@ -154,7 +154,7 @@ class MeetingAssistant:
             )
             # 다이얼 결과 수신용
             self.diar_inference.attach_hooks(self._diar_hook)
-            self.diar_inference.attach_observers(DebugObserver())
+            # self.diar_inference.attach_observers(DebugObserver())
             print("다이얼 인퍼런스")
             # inference를 백그라운드 스레드로 실행
             threading.Thread(target=self._run_diar_inference, daemon=True).start()
@@ -348,9 +348,9 @@ class MeetingAssistant:
         if DBG_STT:
             # 입력 sanity: 길이/진폭
             m = float(np.max(np.abs(frame))) if len(frame) else 0.0
-            print(f"[DBG] VAD in: len={len(frame)} max_abs={m:.4f} total_samples={self.total_samples}")
+            # print(f"[DBG] VAD in: len={len(frame)} max_abs={m:.4f} total_samples={self.total_samples}")
 
-        print("[DBG] VAD raw event:", event)
+        # print("[DBG] VAD raw event:", event)
 
         # 발화 중인 경우에만 버퍼 누적
         if event is None:
@@ -401,6 +401,77 @@ class MeetingAssistant:
             return [(audio, t0, t1)]
 
         return None
+
+    # VAD에서 확정한 발화를 speaker 구간별로 분할
+    def _split_utt_by_speaker_timeline(self, utt_audio: np.ndarray, u0: float, u1: float):
+        if u1 <= u0 or utt_audio is None or len(utt_audio) == 0:
+            return []
+
+        MIN_SPK_PIECE_SEC = 0.4  # 너무 짧은 조각은 무시/흡수
+        MERGE_GAP_SEC = 0.25  # 같은 speaker가 이 gap 이하면 합치기
+
+        # 타임라인 스냅샷
+        with self.timeline_lock:
+            tl = list(self.timeline)
+
+        # utterance와 겹치는 segment 수집, 클램핑
+        segs = []
+        for s, e, spk in tl:
+            if e <= u0:
+                continue
+            if s >= u1:
+                break
+            ss = max(u0, s)
+            ee = min(u1, e)
+            if ee > ss:
+                segs.append([ss, ee, spk])
+
+        if not segs:
+            # timeline이 없으면 Unknown 반환
+            return [(utt_audio, u0, u1, "Unknown")]
+
+        segs.sort(key=lambda x: x[0])
+
+        # 같은 화자끼리 합치기
+        merged = []
+        for ss, ee, spk in segs:
+            if not merged:
+                merged.append([ss, ee, spk])
+                continue
+            ps, pe, pspk = merged[-1]
+            if spk == pspk and ss - pe <= MERGE_GAP_SEC:
+                merged[-1][1] = max(pe, ee)
+            else:
+                merged.append([ss, ee, spk])
+
+        # 4) 너무 짧은 조각 제거(단, 중간에 끼는 짧은 조각은 양옆으로 흡수하는 게 더 좋지만 일단 제거)
+        filtered = []
+        for ss, ee, spk in merged:
+            if (ee - ss) >= MIN_SPK_PIECE_SEC:
+                filtered.append([ss, ee, spk])
+
+        if not filtered:
+            return [(utt_audio, u0, u1, self._assign_speaker_by_overlap(u0, u1))]
+
+        # 오디오 분할
+        out = []
+        for ss, ee, spk in filtered:
+            i0 = int((ss - u0) * SAMPLE_RATE)
+            i1 = int((ee - u0) * SAMPLE_RATE)
+            i0 = max(0, min(len(utt_audio), i0))
+            i1 = max(0, min(len(utt_audio), i1))
+            if i1 <= i0:
+                continue
+            piece = utt_audio[i0:i1]
+            if len(piece) / SAMPLE_RATE < MIN_UTT_SEC:
+                continue
+            out.append((piece, ss, ee, spk))
+
+        # 분할 결과가 너무 많거나 너무 잘게 나뉘면 fallback
+        if len(out) >= 8:
+            return [(utt_audio, u0, u1, self._assign_speaker_by_overlap(u0, u1))]
+
+        return out
 
     # 요약, 흐름, 결정사항 추출
     def _run_gemini_analysis(self, text_chunk, main_topic):
@@ -454,12 +525,16 @@ class MeetingAssistant:
                 break
                 
             audio_np, t0, t1 = item
-            text = await asyncio.to_thread(self._run_whisper, audio_np)
-            if not text:
-                self.stt_queue.task_done()
-                continue
+            pieces = self._split_utt_by_speaker_timeline(audio_np, t0, t1)
 
-            speaker = self._assign_speaker_by_overlap(t0, t1)
+            for piece_audio, p0, p1, spk in pieces:
+                text = await asyncio.to_thread(self._run_whisper, piece_audio)
+                if not text:
+                    self.stt_queue.task_done()
+                    continue
+
+                if spk == "Unknown":
+                    speaker = self._assign_speaker_by_overlap(t0, t1)
 
             # 오디오 저장용
             wav_path = self._save_segment_wav(audio_np, speaker, t0, t1)
