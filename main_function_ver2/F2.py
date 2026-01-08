@@ -237,6 +237,10 @@ class MeetingAssistant:
         # VAD 샘플 청크 채우기용
         self._vad_pending = np.zeros((0,), dtype=np.float32)
 
+        # 발화 단위 디버그 로그
+        self.debug_logs = []
+        self._debug_lock = threading.Lock()
+
     # 전사 전 음성 파일 저장용
     def _save_segment_wav(self, seg_audio: np.ndarray, speaker: str, abs_start: float, abs_end: float) -> str:
         self._segment_seq += 1
@@ -280,10 +284,10 @@ class MeetingAssistant:
 
     # 변경사항: STT를 여기서 진행하는게 아니라 화자 타임라인만 누적하는걸로 변경
     def _diar_hook(self, result):
-        print("[DBG] _diar_hook called")
+        # print("[DBG] _diar_hook called")
         try:
             annotation, ann_wav = result
-            print("[DBG] ann_wav type:", type(ann_wav))
+            # print("[DBG] ann_wav type:", type(ann_wav))
         except Exception:
             return
 
@@ -291,10 +295,10 @@ class MeetingAssistant:
             if isinstance(ann_wav, SlidingWindowFeature):
                 data = ann_wav.data
                 sw = ann_wav.sliding_window
-                print("[DBG] ann_wav.data type:", type(data), "shape:", getattr(data, "shape", None), "ndim:",
-                      getattr(data, "ndim", None))
-                print("[DBG] sliding_window start/duration/step:", float(getattr(sw, "start", 0.0)),
-                      float(getattr(sw, "duration", 0.0)), float(getattr(sw, "step", 0.0)))
+                # print("[DBG] ann_wav.data type:", type(data), "shape:", getattr(data, "shape", None), "ndim:",
+                #       getattr(data, "ndim", None))
+                # print("[DBG] sliding_window start/duration/step:", float(getattr(sw, "start", 0.0)),
+                #       float(getattr(sw, "duration", 0.0)), float(getattr(sw, "step", 0.0)))
         except Exception as e:
             print("[DBG] ann_wav inspect error:", e)
 
@@ -339,6 +343,20 @@ class MeetingAssistant:
         if best_ov < 0.30 * (u1 - u0):
             return "Unknown"
         return best_spk
+
+    # 각 구간 화자별 overlap 시간 계산
+    def _overlap_scores(self, u0: float, u1: float):
+        if u1 <= u0:
+            return {}
+        with self.timeline_lock:
+            tl = list(self.timeline)
+
+        scores = {}
+        for s, e, spk in tl:
+            ov = max(0.0, min(u1, e) - max(u0, s))
+            if ov > 0:
+                scores[spk] = scores.get(spk, 0.0) + ov
+        return scores
 
     # 발화 구간 구분해서 오디오 반환함수
     def _vad_process_frame(self, frame: np.ndarray):
@@ -518,50 +536,112 @@ class MeetingAssistant:
         print("[DBG] _stt_worker started")
         while self.is_running:
             item = await self.stt_queue.get()
-            if DBG_STT:
-                print("[DBG] _stt_worker got item:", None if item is None else (len(item[0]), item[1], item[2]))
-            if item is None:
-                self.stt_queue.task_done()
-                break
+            try:
+                if DBG_STT:
+                    print("[DBG] _stt_worker got item:", None if item is None else (len(item[0]), item[1], item[2]))
+                if item is None:
+                    break
+
+                audio_np, t0, t1 = item
+                pieces = self._split_utt_by_speaker_timeline(audio_np, t0, t1)
+
+                # 디버그용
+                utt_scores = self._overlap_scores(t0, t1)
+                utt_dur = max(1e-6, (t1 - t0))
+                utt_candidates = sorted(
+                    [(k, v, v / utt_dur) for k, v in utt_scores.items()],
+                    key=lambda x: x[1],
+                    reverse=True
+                )[:8]
+
+                with self.timeline_lock:
+                    tl_tail = list(self.timeline)[-30:]
+
+                piece_debug = []
+                for (_piece_audio, p0, p1, spk) in pieces:
+                    ps = self._overlap_scores(p0, p1)
+                    pdur = max(1e-6, (p1 - p0))
+                    pcands = sorted([(k, v, v / pdur) for k, v in ps.items()],
+                                    key=lambda x: x[1], reverse=True)[:6]
+                    piece_debug.append({
+                        "p0": float(p0), "p1": float(p1),
+                        "dur": float(p1 - p0),
+                        "spk_from_timeline": spk,
+                        "candidates": [(k, float(v), float(r)) for (k, v, r) in pcands],
+                    })
+
+                dbg_entry = {
+                    "time": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "utt": {"t0": float(t0), "t1": float(t1), "dur": float(t1 - t0)},
+                    "utt_candidates": [(k, float(v), float(r)) for (k, v, r) in utt_candidates],
+                    "pieces": piece_debug,
+                    "timeline_tail": [(float(s), float(e), spk) for (s, e, spk) in tl_tail],
+                }
+
+                with self._debug_lock:
+                    self.debug_logs.append(dbg_entry)
                 
-            audio_np, t0, t1 = item
-            pieces = self._split_utt_by_speaker_timeline(audio_np, t0, t1)
+                # piece 단위로 STT 후 저장
+                any_written = False
 
-            for piece_audio, p0, p1, spk in pieces:
-                text = await asyncio.to_thread(self._run_whisper, piece_audio)
-                if not text:
-                    self.stt_queue.task_done()
-                    continue
+                for piece_audio, p0, p1, spk in pieces:
+                    # 화자 처음에 배정
+                    speaker = spk
+                    if speaker == "Unknown":
+                        # 없을경우 다시 매칭
+                        speaker = self._assign_speaker_by_overlap(p0, p1)
 
-                if spk == "Unknown":
-                    speaker = self._assign_speaker_by_overlap(t0, t1)
+                    # 디버그용
+                    if DBG_STT:
+                        pdur = (p1 - p0)
+                        print(f"[DBG] whisper start: speaker={speaker} t=({p0:.2f}-{p1:.2f}) dur={pdur:.2f}s len={len(piece_audio)}")
 
-            # 오디오 저장용
-            wav_path = self._save_segment_wav(audio_np, speaker, t0, t1)
-            meta = {
-                "time": datetime.datetime.now().isoformat(),
-                "speaker": speaker,
-                "segment_start": float(t0),
-                "segment_end": float(t1),
-                "wav_path": wav_path,
-                "text": text,
-            }
-            with open(self.segment_index_path, "a", encoding="utf-8") as jf:
-                jf.write(json.dumps(meta, ensure_ascii=False) + "\n")
+                    text = await asyncio.to_thread(self._run_whisper, piece_audio)
+                    text = (text or "").strip()
 
-            log_text = f"[{speaker}] {text}"
-            with self._transcript_lock:
-                self.full_transcript.append(log_text)
-                print(f" {log_text}")
+                    if DBG_STT:
+                        print(f"[DBG] whisper done : speaker={speaker} text_len={len(text)}")
 
-            # 분석 버퍼
-            self.transcript_buffer.append(log_text)
-            if len(self.transcript_buffer) >= BUFFER_SIZE:
-                chunk_to_analyze = "\n".join(self.transcript_buffer)
-                self.transcript_buffer = []
-                asyncio.create_task(self.analyze_task(chunk_to_analyze))
+                    if not text:
+                        continue
 
-            self.stt_queue.task_done()
+                    # 조각 단위 오디오 저장
+                    wav_path = self._save_segment_wav(piece_audio, speaker, p0, p1)
+                    meta = {
+                        "time": datetime.datetime.now().isoformat(),
+                        "speaker": speaker,
+                        "segment_start": float(p0),
+                        "segment_end": float(p1),
+                        "wav_path": wav_path,
+                        "text": text,
+                    }
+                    with open(self.segment_index_path, "a", encoding="utf-8") as jf:
+                        jf.write(json.dumps(meta, ensure_ascii=False) + "\n")
+
+                    log_text = f"[{speaker}] {text}"
+                    with self._transcript_lock:
+                        self.full_transcript.append(log_text)
+                        print(f" {log_text}")
+
+                    # 분석 버퍼
+                    self.transcript_buffer.append(log_text)
+                    if len(self.transcript_buffer) >= BUFFER_SIZE:
+                        chunk_to_analyze = "\n".join(self.transcript_buffer)
+                        self.transcript_buffer = []
+                        asyncio.create_task(self.analyze_task(chunk_to_analyze))
+
+                    any_written = True
+
+                if DBG_STT and (not any_written):
+                    print("[DBG] _stt_worker: no text written for this UTT (all pieces empty)")
+
+            except Exception as e:
+                print("[ERR] _stt_worker exception:", repr(e))
+
+            finally:
+                self.stt_queue.task_done()
+
+        print("[DBG] _stt_worker exiting")
 
     # Gemini request, 결과 출력
     async def analyze_task(self, full_text):
@@ -636,6 +716,7 @@ class MeetingAssistant:
                 while len(self._vad_pending) >= VAD_FRAME:
                     sub = self._vad_pending[:VAD_FRAME]
                     self._vad_pending = self._vad_pending[VAD_FRAME:]
+                    self.total_samples += VAD_FRAME
 
                     # VAD로 발화 확정
                     utts = self._vad_process_frame(sub)
@@ -646,9 +727,6 @@ class MeetingAssistant:
                             if DBG_STT:
                                 print(f"[DBG] stt_queue.put: len={len(audio_np)} t0={t0:.3f} t1={t1:.3f}")
                             await self.stt_queue.put((audio_np, t0, t1))
-
-                # 시간 업데이트
-                self.total_samples += VAD_FRAME
 
                 await asyncio.sleep(0.001)
 
@@ -701,6 +779,41 @@ class MeetingAssistant:
             f.write("[2. 전체 스크립트]\n")
             for line in self.full_transcript:
                 f.write(f"{line}\n")
+
+            f.write("\n" + "=" * 50 + "\n")
+            f.write("[3. 디버그 로그: 발화/화자 매칭 상세]\n")
+
+            with self._debug_lock:
+                logs = list(self.debug_logs)
+
+            for i, d in enumerate(logs, 1):
+                utt = d["utt"]
+                f.write(
+                    f"\n--- UTT #{i}  time={d['time']}  t=({utt['t0']:.2f}-{utt['t1']:.2f}) dur={utt['dur']:.2f}s ---\n")
+
+                # 발화 단위 후보
+                f.write("  [UTT candidates by overlap]\n")
+                if d["utt_candidates"]:
+                    for spk, ov, ratio in d["utt_candidates"]:
+                        f.write(f"    - {spk}: ov={ov:.2f}s ratio={ratio:.2f}\n")
+                else:
+                    f.write("    - (none)  => timeline overlap=0\n")
+
+                # 발화 구성 조각
+                f.write("  [Pieces]\n")
+                for j, p in enumerate(d["pieces"], 1):
+                    f.write(
+                        f"    * piece#{j} ({p['p0']:.2f}-{p['p1']:.2f}) dur={p['dur']:.2f}s timeline_spk={p['spk_from_timeline']}\n")
+                    if p["candidates"]:
+                        for spk, ov, ratio in p["candidates"]:
+                            f.write(f"        - cand {spk}: ov={ov:.2f}s ratio={ratio:.2f}\n")
+                    else:
+                        f.write("        - (none)\n")
+
+                # 당시 diart timeline 스냅샷
+                f.write("  [Timeline tail - last 30]\n")
+                for s, e, spk in d["timeline_tail"]:
+                    f.write(f"    {s:7.2f}-{e:7.2f}  {spk}\n")
 
         print(f"저장 완료: {path}")
 
