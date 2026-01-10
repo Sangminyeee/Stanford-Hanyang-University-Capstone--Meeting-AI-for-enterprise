@@ -13,6 +13,7 @@ from huggingface_hub import login
 from rx.core import Observer
 import wave
 from collections import deque
+import re
 
 # Gemini API
 from google import genai
@@ -241,7 +242,19 @@ class MeetingAssistant:
         self.debug_logs = []
         self._debug_lock = threading.Lock()
 
-    # 전사 전 음성 파일 저장용
+        # 원본 오디오 링버퍼 (기존 음성 끊기는거 해결책을 그냥 전체 스트림에서 strip할란다 하)
+        self._ring = deque()
+        self._ring_samples = 0  # 링버퍼 안 총 샘플 수
+        self._ring_max_sec = 60.0  # 1분 보관 (설마 한문장을 1분동안 못잡지는 않겠지)
+        self._ring_max_samples = int(self._ring_max_sec * SAMPLE_RATE)
+
+        self._ring_start_sample = 0  # 링버퍼의 샘플 인덱스 기준 시작점
+        self._ring_lock = threading.Lock()
+
+        # 문장 확정할때 쓰는 절대시간
+        self._commit_t = 0.0 # 이 시간 이전시간은 버려도됨
+
+        # 전사 전 음성 파일 저장용
     def _save_segment_wav(self, seg_audio: np.ndarray, speaker: str, abs_start: float, abs_end: float) -> str:
         self._segment_seq += 1
         seg_id = f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{self._segment_seq:06d}"
@@ -260,12 +273,118 @@ class MeetingAssistant:
 
         return wav_path
 
+    # 링버퍼 푸쉬하는거
+    def _ring_push(self, frame: np.ndarray):
+        x = np.asarray(frame, dtype=np.float32)
+        with self._ring_lock:
+            self._ring.append(x)
+            self._ring_samples += len(x)
+
+            # 오래된 프레임 제거
+            while self._ring_samples > self._ring_max_samples and len(self._ring) > 1:
+                old = self._ring.popleft()
+                self._ring_samples -= len(old)
+                self._ring_start_sample += len(old)
+
+    # 링버퍼에서 자르는거
+    def _ring_slice(self, abs_t0: float, abs_t1: float) -> np.ndarray:
+        if abs_t1 <= abs_t0:
+            return np.zeros((0,), dtype=np.float32)
+
+        s0 = int(abs_t0 * SAMPLE_RATE)
+        s1 = int(abs_t1 * SAMPLE_RATE)
+
+        with self._ring_lock:
+            base = self._ring_start_sample
+            # 링버퍼 범위 밖이면 빈 배열
+            if s1 <= base or s0 >= base + self._ring_samples:
+                return np.zeros((0,), dtype=np.float32)
+
+            s0 = max(s0, base)
+            s1 = min(s1, base + self._ring_samples)
+            if s1 <= s0:
+                return np.zeros((0,), dtype=np.float32)
+
+            # deque가지고 필요한 부분만 복사
+            out = []
+            cur = base
+            need0, need1 = s0, s1
+
+            for chunk in self._ring:
+                nxt = cur + len(chunk)
+                if nxt <= need0:
+                    cur = nxt
+                    continue
+                if cur >= need1:
+                    break
+
+                i0 = max(0, need0 - cur)
+                i1 = min(len(chunk), need1 - cur)
+                if i1 > i0:
+                    out.append(chunk[i0:i1])
+
+                cur = nxt
+
+            if not out:
+                return np.zeros((0,), dtype=np.float32)
+            return np.concatenate(out, axis=0)
+
+    # whisper segment 문장부호 변환기
+    def _iter_sentence_candidates(self, segments, piece_abs_t0: float):
+        MAX_SENT_SEC = 30.0 # 최대문장길이
+
+        for seg in segments:
+            txt = (seg.get("text") or "").strip()
+            if not txt:
+                continue
+            s = piece_abs_t0 + float(seg.get("start", 0.0))
+            e = piece_abs_t0 + float(seg.get("end", 0.0))
+            if e <= s:
+                continue
+
+            # 문장부호 기준 split
+            parts = re.split(r'([.!?…。！？]+)', txt)
+            sentences = []
+            for i in range(0, len(parts), 2):
+                chunk = parts[i].strip()
+                punct = parts[i + 1] if i + 1 < len(parts) else ""
+                if chunk:
+                    sentences.append((chunk + punct).strip())
+
+            if not sentences:
+                sentences = [txt]
+
+            # 시간은 길이 비율로 분배 (임시)
+            dur = max(1e-6, e - s)
+            total = sum(max(1, len(t)) for t in sentences)
+            tcur = s
+            for idx, sent in enumerate(sentences):
+                w = max(1, len(sent)) / total
+                segdur = dur * w
+                ss = tcur
+                ee = e if idx == len(sentences) - 1 else (tcur + segdur)
+
+                # 3) 너무 길면 강제 컷
+                if (ee - ss) > MAX_SENT_SEC:
+                    # 강제 컷은 텍스트를 그대로 두고 시간만 쪼개기
+                    n = int(np.ceil((ee - ss) / MAX_SENT_SEC))
+                    step = (ee - ss) / n
+                    for k in range(n):
+                        a = ss + k * step
+                        b = ee if k == n - 1 else (ss + (k + 1) * step)
+                        yield sent, a, b
+                else:
+                    yield sent, ss, ee
+
+                tcur = ee
+
     # -------------------- [Thread] AI 처리 함수들 --------------------
     # Whisper STT
     def _run_whisper(self, audio_np):
         try:
+            # result 전체 반환하게해서 segment 받아오기
             result = self.stt_model.transcribe(audio_np, language="ko", fp16=FP16_RUN)
-            return result['text'].strip()
+            return result or {}
         except Exception as e:
             print(f"Whisper Error: {e}")
             return ""
@@ -493,6 +612,8 @@ class MeetingAssistant:
 
     # 요약, 흐름, 결정사항 추출
     def _run_gemini_analysis(self, text_chunk, main_topic):
+        # 사용량 다써서...
+        return None
         prompt = f"""
         당신은 회의 서기입니다. 메인 주제는 "{main_topic}"입니다.
         입력된 회의 내용을 분석하여 아래 JSON 포맷으로 응답하세요.
@@ -537,88 +658,53 @@ class MeetingAssistant:
         while self.is_running:
             item = await self.stt_queue.get()
             try:
-                if DBG_STT:
-                    print("[DBG] _stt_worker got item:", None if item is None else (len(item[0]), item[1], item[2]))
                 if item is None:
                     break
 
                 audio_np, t0, t1 = item
-                pieces = self._split_utt_by_speaker_timeline(audio_np, t0, t1)
 
-                # 디버그용
-                utt_scores = self._overlap_scores(t0, t1)
-                utt_dur = max(1e-6, (t1 - t0))
-                utt_candidates = sorted(
-                    [(k, v, v / utt_dur) for k, v in utt_scores.items()],
-                    key=lambda x: x[1],
-                    reverse=True
-                )[:8]
-
-                with self.timeline_lock:
-                    tl_tail = list(self.timeline)[-30:]
-
-                piece_debug = []
-                for (_piece_audio, p0, p1, spk) in pieces:
-                    ps = self._overlap_scores(p0, p1)
-                    pdur = max(1e-6, (p1 - p0))
-                    pcands = sorted([(k, v, v / pdur) for k, v in ps.items()],
-                                    key=lambda x: x[1], reverse=True)[:6]
-                    piece_debug.append({
-                        "p0": float(p0), "p1": float(p1),
-                        "dur": float(p1 - p0),
-                        "spk_from_timeline": spk,
-                        "candidates": [(k, float(v), float(r)) for (k, v, r) in pcands],
-                    })
-
-                dbg_entry = {
-                    "time": datetime.datetime.now().isoformat(timespec="seconds"),
-                    "utt": {"t0": float(t0), "t1": float(t1), "dur": float(t1 - t0)},
-                    "utt_candidates": [(k, float(v), float(r)) for (k, v, r) in utt_candidates],
-                    "pieces": piece_debug,
-                    "timeline_tail": [(float(s), float(e), spk) for (s, e, spk) in tl_tail],
-                }
-
-                with self._debug_lock:
-                    self.debug_logs.append(dbg_entry)
-                
-                # piece 단위로 STT 후 저장
-                any_written = False
-
-                for piece_audio, p0, p1, spk in pieces:
-                    # 화자 처음에 배정
-                    speaker = spk
-                    if speaker == "Unknown":
-                        # 없을경우 다시 매칭
-                        speaker = self._assign_speaker_by_overlap(p0, p1)
-
-                    # 디버그용
-                    if DBG_STT:
-                        pdur = (p1 - p0)
-                        print(f"[DBG] whisper start: speaker={speaker} t=({p0:.2f}-{p1:.2f}) dur={pdur:.2f}s len={len(piece_audio)}")
-
-                    text = await asyncio.to_thread(self._run_whisper, piece_audio)
-                    text = (text or "").strip()
-
-                    if DBG_STT:
-                        print(f"[DBG] whisper done : speaker={speaker} text_len={len(text)}")
-
+                result = await asyncio.to_thread(self._run_whisper, audio_np)
+                segments = (result or {}).get("segments") or []
+                if not segments:
+                    # text있는데 segment 없으면, 이 경우 문장 경계가 없는거니까 스킵 or 전체 1문장 처리
+                    text = ((result or {}).get("text") or "").strip()
                     if not text:
                         continue
+                    segments = [{"start": 0.0, "end": float(t1 - t0), "text": text}]
+
+                any_written = False
+
+                # segments -> 문장 후보 생성 -> 확정 문장마다 "원본 링버퍼"에서 오디오 slice
+                for sent_text, s_abs, e_abs in self._iter_sentence_candidates(segments, t0):
+                    sent_text = (sent_text or "").strip()
+                    if not sent_text:
+                        continue
+
+                    # 원본 스트림에서 해당 구간 바로 슬라이스
+                    sent_audio = self._ring_slice(s_abs, e_abs)
+                    if len(sent_audio) < int(MIN_UTT_SEC * SAMPLE_RATE):
+                        continue
+
+                    speaker = self._assign_speaker_by_overlap(s_abs, e_abs)
+                    if speaker == "Unknown":
+                        # 혹시 모르니까 전체기준 한번 더
+                        speaker = self._assign_speaker_by_overlap(t0, t1)
 
                     # 조각 단위 오디오 저장
-                    wav_path = self._save_segment_wav(piece_audio, speaker, p0, p1)
+                    wav_path = self._save_segment_wav(sent_audio, speaker, s_abs, e_abs)
+
                     meta = {
                         "time": datetime.datetime.now().isoformat(),
                         "speaker": speaker,
-                        "segment_start": float(p0),
-                        "segment_end": float(p1),
+                        "segment_start": float(s_abs),
+                        "segment_end": float(e_abs),
                         "wav_path": wav_path,
-                        "text": text,
+                        "text": sent_text,
                     }
                     with open(self.segment_index_path, "a", encoding="utf-8") as jf:
                         jf.write(json.dumps(meta, ensure_ascii=False) + "\n")
 
-                    log_text = f"[{speaker}] {text}"
+                    log_text = f"[{speaker}] {sent_text}"
                     with self._transcript_lock:
                         self.full_transcript.append(log_text)
                         print(f" {log_text}")
@@ -706,6 +792,9 @@ class MeetingAssistant:
 
                 # int16 PCM -> float32 [-1, 1]
                 frame = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+
+                # 링버퍼에 저장
+                self._ring_push(frame)
 
                 # diart로 언제나 연속으로 넘기기
                 self.diar_source.push_audio(frame)
