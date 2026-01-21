@@ -1,6 +1,6 @@
-# run_F2_F4.py
 import asyncio
 import sys
+import signal
 from typing import Callable, Any
 
 from F2 import MeetingAssistant
@@ -46,10 +46,34 @@ async def main():
     # F4 백그라운드
     await flow_ai.start()
 
+    # 키보드 인터럽트로 중간에 끊었을 때 다 처리하기용
+    shutting_down = {"flag": False}
+
+    # Ctrl+C 들어왔을 때 핸들러
+    def _sigint_handler(signum, frame):
+        # 1번째 Ctrl+C 되도록 정상종료
+        if not shutting_down["flag"]:
+            shutting_down["flag"] = True
+            print("\n[pipeline] SIGINT received. Graceful shutdown requested...")
+            try:
+                assistant.is_running = False
+            except Exception:
+                pass
+            return
+
+        # 2번째 Ctrl+C는 강종
+        print("\n[pipeline] SIGINT received again. Force exiting now.", file=sys.stderr)
+        raise KeyboardInterrupt
+
+    old_handler = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, _sigint_handler)
+
     # F2 시작
     try:
         await assistant.start()
     finally:
+        # 핸들러 복구
+        signal.signal(signal.SIGINT, old_handler)
         # F2가 끝나면 F4도 종료
         await flow_ai.stop()
 
@@ -58,4 +82,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
+        # 2번 눌러서 강종할때만 작동
         pass
