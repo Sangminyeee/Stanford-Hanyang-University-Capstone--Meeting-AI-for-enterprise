@@ -25,6 +25,10 @@ class ObservableList(list):
 async def main():
     # F4
     flow_ai = MeetingFlowAI(
+        summary_interval_sec=20,  # 1) 특정 시간마다 요약
+        topic_check_interval_sec=20,  # 2) 안건 변경 감지 템포
+        propose_min_lines=6,  # 안건 후보 띄우기 최소 라인 수
+        opinion_flush_interval_sec=45  # 3) 의견 정리 주기
     )
 
     # F2
@@ -33,11 +37,11 @@ async def main():
     # F2 전사 append 할 때마다 F4로 전달되게 full_transcript를 ObservableList로 교체
     loop = asyncio.get_running_loop()
 
-    # def on_new_transcript_line(line: str):
+    def on_new_transcript_line(line: str):
         # F2의 append 이벤트루프 호출 방지
-        # loop.call_soon_threadsafe(flow_ai.push_transcript_line, line)
+        loop.call_soon_threadsafe(flow_ai.push_transcript_line, line)
 
-    # assistant.full_transcript = ObservableList(on_new_transcript_line)
+    assistant.full_transcript = ObservableList(on_new_transcript_line)
 
     # F4 백그라운드
     await flow_ai.start()
