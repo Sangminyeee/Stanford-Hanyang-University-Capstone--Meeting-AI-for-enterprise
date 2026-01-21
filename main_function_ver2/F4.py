@@ -11,9 +11,9 @@ from typing import Deque, Dict, List, Optional, Tuple, Any
 from google import genai
 from google.genai import types
 
-
 # 내용 요약할때 최근 내용만 요약하게 기존 전사 내용 요약
 LINE_RE = re.compile(r"^\s*\[(?P<speaker>[^\]]+)\]\s*(?P<text>.+?)\s*$")
+
 
 def parse_transcript_line(line: str) -> Tuple[str, str]:
     m = LINE_RE.match(line or "")
@@ -91,13 +91,13 @@ class AgendaItem:
 # -----------------------------
 class MeetingFlowAI:
     def __init__(
-        self,
-        summary_interval_sec: int = 60,
-        topic_check_interval_sec: int = 20,
-        propose_min_lines: int = 6,
-        opinion_flush_interval_sec: int = 45,
-        llm_model_name: str = None,
-        window_max_lines: int = 200,
+            self,
+            summary_interval_sec: int = 60,
+            topic_check_interval_sec: int = 20,
+            propose_min_lines: int = 6,
+            opinion_flush_interval_sec: int = 45,
+            llm_model_name: str = None,
+            window_max_lines: int = 200,
     ):
         self.summary_interval_sec = int(summary_interval_sec)
         self.topic_check_interval_sec = int(topic_check_interval_sec)
@@ -353,6 +353,7 @@ class MeetingFlowAI:
                     if t:
                         return t
                 print("[F4] 입력이 올바르지 않습니다.")
+
         return await asyncio.to_thread(_input_choice)
 
     async def _switch_agenda(self, title: str, reason: str):
@@ -524,3 +525,43 @@ class MeetingFlowAI:
                 for op in recent:
                     print(f"  - {spk}: {op}")
         print("-" * 70 + "\n")
+
+    # 상태 스냅샷
+    def get_state(self) -> dict:
+        ag = self.current_agenda
+        state = {
+            "ts": time.time(),
+            "current_agenda": {},
+            "agenda_history": [],
+            "recent_tail": [],
+        }
+
+        if ag:
+            state["current_agenda"] = {
+                "title": ag.title,
+                "started_at": ag.started_at,
+                "running_summary": ag.running_summary,
+                "decisions": ag.decisions[-10:],
+                "todos": ag.todos[-15:],
+                "opinions_by_speaker": {
+                    spk: lst[-5:] for spk, lst in ag.opinions_by_speaker.items()
+                },
+            }
+
+        # 최근 전사 일부(화면용)
+        tail = list(self._recent_lines)[-30:]
+        state["recent_tail"] = [
+            {"t": ts, "speaker": spk, "text": txt} for (ts, spk, txt) in tail
+        ]
+
+        # 완료 안건 히스토리 요약
+        for old in self.agenda_history[-10:]:
+            state["agenda_history"].append({
+                "title": old.title,
+                "started_at": old.started_at,
+                "running_summary": old.running_summary,
+                "decisions": old.decisions[-5:],
+                "todos": old.todos[-8:],
+            })
+
+        return state

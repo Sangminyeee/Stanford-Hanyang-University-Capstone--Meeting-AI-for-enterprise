@@ -6,6 +6,46 @@ from typing import Callable, Any
 from F2 import MeetingAssistant
 from F4 import MeetingFlowAI
 
+# 시각화용
+import threading
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse
+
+# 시각화용 서버
+def start_state_server(flow_ai, host="127.0.0.1", port=8765):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            if parsed.path == "/state":
+                try:
+                    data = flow_ai.get_state()
+                    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except Exception as e:
+                    msg = json.dumps({"error": str(e)}).encode("utf-8")
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(msg)))
+                    self.end_headers()
+                    self.wfile.write(msg)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, format, *args):
+            # 기본 로그 끄기(원하면 삭제)
+            return
+
+    server = HTTPServer((host, port), Handler)
+    th = threading.Thread(target=server.serve_forever, daemon=True)
+    th.start()
+    print(f"[run_F2_F4] State server: http://{host}:{port}/state")
+    return server
 
 # F2에서 전사한거 append 할때마다 콜백
 class ObservableList(list):
@@ -45,6 +85,7 @@ async def main():
 
     # F4 백그라운드
     await flow_ai.start()
+    state_server = start_state_server(flow_ai, port=8765)
 
     # 키보드 인터럽트로 중간에 끊었을 때 다 처리하기용
     shutting_down = {"flag": False}
@@ -57,6 +98,7 @@ async def main():
             print("\n[pipeline] SIGINT received. Graceful shutdown requested...")
             try:
                 assistant.is_running = False
+                state_server.shutdown()
             except Exception:
                 pass
             return
