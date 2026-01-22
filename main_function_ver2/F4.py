@@ -128,6 +128,13 @@ class MeetingFlowAI:
         # 안건 선택/변경 중복 방지
         self._awaiting_agenda_choice = False
 
+        # UI에서 선택할 안건 후보
+        self.pending_agenda = {
+            "candidates": [],
+            "reason": "",
+            "created_at": 0.0,
+        }
+
     # 외부(연결파일)에서 호출
     def push_transcript_line(self, line: str):
         # queue.put_nowait는 event loop에서만 안전 -> 연결파일에서 call_soon_threadsafe로 호출하도록 설계함
@@ -282,19 +289,32 @@ class MeetingFlowAI:
         if not w.strip():
             return
 
-        self._awaiting_agenda_choice = True
-        try:
-            candidates = await self._propose_agenda_candidates(w)
-            if not candidates:
-                candidates = self._fallback_candidates(w)
+        candidates = await self._propose_agenda_candidates(w)
+        if not candidates:
+            candidates = self._fallback_candidates(w)
 
-            chosen = await self._ask_user_choose_agenda(candidates, reason=reason)
+        # UI에서 pending에 저장
+        self.pending_agenda = {
+            "candidates": candidates[:3],
+            "reason": reason,
+            "created_at": time.time(),
+        }
 
-            # 새 안건으로 전환
-            await self._switch_agenda(chosen, reason=reason)
+        print("\n" + "=" * 62)
+        print(f"[F4] 안건 후보 생성 / 사유: {reason}")
+        for i, c in enumerate(self.pending_agenda["candidates"], 1):
+            print(f"  {i}) {c}")
+        print("=" * 62 + "\n")
+    
+    # 안건 고르는거
+    async def choose_agenda(self, title: str):
+        title = (title or "").strip()
+        if not title:
+            return
 
-        finally:
-            self._awaiting_agenda_choice = False
+        # pending 비우고 전환
+        self.pending_agenda = {"candidates": [], "reason": "", "created_at": 0.0}
+        await self._switch_agenda(title, reason="UI 선택")
 
     async def _propose_agenda_candidates(self, window_text: str) -> List[str]:
         system = "너는 회의 안건 정리 전문가다. 전사 내용을 바탕으로 중복 없는 안건 제목 후보를 만든다."
@@ -563,5 +583,13 @@ class MeetingFlowAI:
                 "decisions": old.decisions[-5:],
                 "todos": old.todos[-8:],
             })
+            
+        # 아젠다 UI에서 선택 관련
+        state["pending_agenda"] = {
+            "candidates": list(self.pending_agenda.get("candidates", [])),
+            "reason": self.pending_agenda.get("reason", ""),
+            "created_at": self.pending_agenda.get("created_at", 0.0),
+        }
+        state["needs_agenda_choice"] = bool(state["pending_agenda"]["candidates"]) and (self.current_agenda is None)
 
         return state

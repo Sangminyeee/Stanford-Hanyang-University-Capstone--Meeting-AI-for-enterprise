@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 
 # 시각화용 서버
-def start_state_server(flow_ai, host="127.0.0.1", port=8765):
+def start_state_server(flow_ai, assistant, loop, host="127.0.0.1", port=8765):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             parsed = urlparse(self.path)
@@ -37,6 +37,38 @@ def start_state_server(flow_ai, host="127.0.0.1", port=8765):
                 self.send_response(404)
                 self.end_headers()
 
+        def do_POST(self):
+            parsed = urlparse(self.path)
+            if parsed.path != "/choose_agenda":
+                self.send_response(404)
+                self.end_headers()
+                return
+
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length > 0 else b"{}"
+                payload = json.loads(raw.decode("utf-8"))
+                title = (payload.get("title") or "").strip()
+                if not title:
+                    raise ValueError("title is required")
+
+                # assyncio 루프 위에 태스크 올리기
+                loop.call_soon_threadsafe(lambda: asyncio.create_task(flow_ai.choose_agenda(title)))
+
+                resp = json.dumps({"ok": True, "chosen": title}, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+            except Exception as e:
+                msg = json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False).encode("utf-8")
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(msg)))
+                self.end_headers()
+                self.wfile.write(msg)
+                
         def log_message(self, format, *args):
             # 기본 로그 끄기(원하면 삭제)
             return
@@ -85,7 +117,7 @@ async def main():
 
     # F4 백그라운드
     await flow_ai.start()
-    state_server = start_state_server(flow_ai, port=8765)
+    state_server = start_state_server(flow_ai, assistant, loop, port=8765)
 
     # 키보드 인터럽트로 중간에 끊었을 때 다 처리하기용
     shutting_down = {"flag": False}

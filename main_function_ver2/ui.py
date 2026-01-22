@@ -4,6 +4,7 @@ import streamlit as st
 from datetime import datetime
 
 STATE_URL = "http://127.0.0.1:8765/state"
+CHOOSE_URL = "http://127.0.0.1:8765/choose_agenda"
 
 st.set_page_config(page_title="Meeting Flow Dashboard", layout="wide")
 st.title("회의 흐름 대시보드 (F2 + F4)")
@@ -19,11 +20,52 @@ def fetch_state():
     r.raise_for_status()
     return r.json()
 
+def choose_agenda(title: str):
+    r = requests.post(CHOOSE_URL, json={"title": title}, timeout=2.0)
+    r.raise_for_status()
+    return r.json()
+
 try:
     data = fetch_state()
 except Exception as e:
     st.error(f"상태 서버 연결 실패: {e}")
     st.stop()
+
+# 안건 선택 UI
+pending = (data.get("pending_agenda") or {})
+needs_choice = bool(data.get("needs_agenda_choice"))
+
+if needs_choice:
+    st.warning(f"안건 선택이 필요합니다. (사유: {pending.get('reason','')})")
+
+    cands = pending.get("candidates") or []
+    colA, colB = st.columns([2, 1])
+
+    with colA:
+        selected = None
+        if cands:
+            selected = st.selectbox("안건 후보 선택", cands)
+        custom = st.text_input("또는 안건 직접 입력", value="")
+
+    with colB:
+        if st.button("선택 확정", type="primary"):
+            title = (custom.strip() or (selected or "").strip())
+            if not title:
+                st.error("안건 제목을 선택하거나 직접 입력하세요.")
+            else:
+                try:
+                    choose_agenda(title)
+                    st.success(f"안건 선택됨: {title}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"안건 선택 전송 실패: {e}")
+
+st.divider()
+
+st.subheader("최근 전사")
+tail = data.get("f2_recent_tail") or []
+for x in tail[-40:]:
+    st.write(x["line"])
 
 col1, col2 = st.columns([1, 1])
 
