@@ -43,26 +43,47 @@ if needs_choice:
     st.warning(f"안건 선택이 필요합니다. (사유: {pending.get('reason','')})")
 
     cands = pending.get("candidates") or []
-    colA, colB = st.columns([2, 1])
 
-    with colA:
-        selected = None
-        if cands:
-            selected = st.selectbox("안건 후보 선택", cands)
-        custom = st.text_input("또는 안건 직접 입력", value="")
+    btn_titles = [
+        cands[0] if len(cands) > 0 else None,
+        cands[1] if len(cands) > 1 else None,
+        cands[2] if len(cands) > 2 else None,
+    ]
 
-    with colB:
-        if st.button("선택 확정", type="primary"):
-            title = (custom.strip() or (selected or "").strip())
-            if not title:
-                st.error("안건 제목을 선택하거나 직접 입력하세요.")
+    col1, col2, col3 = st.columns(3)
+    cols = [col1, col2, col3]
+
+    chosen = None
+    for i, (col, title) in enumerate(zip(cols, btn_titles), start=1):
+        with col:
+            if title:
+                if st.button(title, key=f"agenda_btn_{i}", use_container_width=True):
+                    chosen = title
             else:
-                try:
-                    choose_agenda(title)
-                    st.success(f"안건 선택됨: {title}")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"안건 선택 전송 실패: {e}")
+                st.button("—", key=f"agenda_btn_empty_{i}", disabled=True, use_container_width=True)
+
+    custom = st.text_input("또는 안건 직접 입력", value="")
+
+    if chosen is not None:
+        try:
+            choose_agenda(chosen)
+            st.success(f"안건 선택됨: {chosen}")
+            st.rerun()
+        except Exception as e:
+            st.error(f"안건 선택 전송 실패: {e}")
+
+        # 직접 입력을 쓰고 싶으면 "확정" 버튼 하나만 둠
+    if st.button("직접 입력 안건 확정", type="primary"):
+        title = custom.strip()
+        if not title:
+            st.error("직접 입력 안건 제목을 입력하세요.")
+        else:
+            try:
+                choose_agenda(title)
+                st.success(f"안건 선택됨: {title}")
+                st.rerun()
+            except Exception as e:
+                st.error(f"안건 선택 전송 실패: {e}")
 
 st.divider()
 
