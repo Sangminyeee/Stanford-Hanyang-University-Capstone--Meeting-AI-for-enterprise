@@ -13,6 +13,8 @@ from google.genai import types
 
 # 내용 요약할때 최근 내용만 요약하게 기존 전사 내용 요약
 LINE_RE = re.compile(r"^\s*\[(?P<speaker>[^\]]+)\]\s*(?P<text>.+?)\s*$")
+# 앞에 화자 태그 제거
+BRACKET_SPK_RE = re.compile(r"^\s*\[[^\]]+\]\s*")
 
 
 def parse_transcript_line(line: str) -> Tuple[str, str]:
@@ -21,11 +23,12 @@ def parse_transcript_line(line: str) -> Tuple[str, str]:
         return "Unknown", (line or "").strip()
     return m.group("speaker").strip(), m.group("text").strip()
 
-
 def now_hhmm() -> str:
     return datetime.datetime.now().strftime("%H:%M")
 
-
+def strip_speaker_tag(line: str) -> str:
+    # "[speaker1] 내용" -> "내용"
+    return BRACKET_SPK_RE.sub("", (line or "")).strip()
 # -----------------------------
 # LLM 클라이언트 (Gemini + fallback)
 # -----------------------------
@@ -228,7 +231,7 @@ class MeetingFlowAI:
     # -----------------------------
     # 텍스트 윈도우 만들기
     # -----------------------------
-    def _window_text(self, seconds: Optional[int] = None) -> str:
+    def _window_text(self, seconds: Optional[int] = None, strip_speaker: bool = False) -> str:
         if not self._recent_lines:
             return ""
         now = time.time()
@@ -237,13 +240,17 @@ class MeetingFlowAI:
             items = [x for x in items if (now - x[0]) <= seconds]
         # 너무 길면 최근 위주로 자르기
         tail = items[-120:]  # 안전 상한
-        return "\n".join([f"[{spk}] {txt}" for _, spk, txt in tail])
+
+        if strip_speaker:
+            return "\n".join([strip_speaker_tag(txt) for _, _, txt in tail if txt.strip()])
+        else:
+            return "\n".join([f"[{spk}] {txt}" for _, spk, txt in tail])
 
     # -----------------------------
     # 1) 특정 시간마다 요약: "~~~하는 중입니다"
     # -----------------------------
     async def _emit_progress_summary(self):
-        w = self._window_text(seconds=self.summary_interval_sec * 2)
+        w = self._window_text(seconds=self.summary_interval_sec * 2, strip_speaker=True)
         if not w.strip():
             return
 
@@ -295,7 +302,7 @@ class MeetingFlowAI:
             return
         self._last_propose_at = now
 
-        w = self._window_text(seconds=180)
+        w = self._window_text(seconds=180, strip_speaker=True)
         if not w.strip():
             return
 
@@ -409,7 +416,7 @@ class MeetingFlowAI:
     # -----------------------------
     async def _check_topic_shift(self):
         # 최근 텍스트가 너무 없으면 스킵
-        w = self._window_text(seconds=120)
+        w = self._window_text(seconds=120, strip_speaker=True)
         if not w.strip() or not self.current_agenda:
             return
 
@@ -443,7 +450,7 @@ class MeetingFlowAI:
             return
 
         # 최근 3~5분을 대상으로 정리(너무 길면 비용↑)
-        w = self._window_text(seconds=300)
+        w = self._window_text(seconds=300, strip_speaker=True)
         if not w.strip():
             return
 
