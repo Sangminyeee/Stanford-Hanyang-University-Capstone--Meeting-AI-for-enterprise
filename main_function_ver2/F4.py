@@ -135,7 +135,10 @@ class MeetingFlowAI:
             "created_at": 0.0,
         }
 
-    # 외부(연결파일)에서 호출
+        self.progress_summary = ""
+        self.progress_timeline = deque(maxlen=50)
+
+        # 외부(연결파일)에서 호출
     def push_transcript_line(self, line: str):
         # queue.put_nowait는 event loop에서만 안전 -> 연결파일에서 call_soon_threadsafe로 호출하도록 설계함
         self._queue.put_nowait(line)
@@ -244,10 +247,8 @@ class MeetingFlowAI:
         if not w.strip():
             return
 
-        agenda = self.current_agenda.title if self.current_agenda else "알 수 없음"
         system = "너는 실시간 회의 서기다. 과장 없이, 현재 진행 상태를 한 문장으로 보고한다."
         user = (
-            f"현재 안건: {agenda}\n\n"
             f"최근 전사:\n{w}\n\n"
             "요구:\n"
             "- 한국어 한 문장\n"
@@ -256,12 +257,21 @@ class MeetingFlowAI:
         )
         schema = '{"progress": "현재 ~~ 안건에 대해 ~~하는 중입니다."}'
 
-        out = await self.llm.json_call(system, user, schema)
-        if out and isinstance(out, dict) and out.get("progress"):
-            progress = str(out["progress"]).strip()
-        else:
-            # fallback: 단순 휴리스틱
-            progress = f"현재 '{agenda}' 안건에 대해 논의하는 중입니다."
+        out = None
+        if self.llm and getattr(self.llm, "enabled", False):
+            out = self.llm.json_call(system=system, user=user, schema_hint='{"progress":"..."}')
+
+        progress = ""
+
+        if isinstance(out, dict):
+            progress = (out.get("progress") or "").strip()
+
+        if not progress:
+            # 안건 없이도 계속 요약되게
+            progress = "현재 회의 내용을 정리하는 중입니다."
+
+        self.progress_summary = progress
+        self.progress_timeline.append((time.time(), progress))
 
         print(f"\n[F4][진행요약 {now_hhmm()}] {progress}\n")
 
@@ -551,6 +561,10 @@ class MeetingFlowAI:
         ag = self.current_agenda
         state = {
             "ts": time.time(),
+            "progress_summary": self.progress_summary,
+            "progress_timeline": [
+                {"t": ts, "text": txt} for (ts, txt) in list(self.progress_timeline)[-10:]
+            ],
             "current_agenda": {},
             "agenda_history": [],
             "recent_tail": [],

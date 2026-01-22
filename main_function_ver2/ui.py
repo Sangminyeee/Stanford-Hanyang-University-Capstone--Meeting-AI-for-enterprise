@@ -31,6 +31,10 @@ except Exception as e:
     st.error(f"상태 서버 연결 실패: {e}")
     st.stop()
 
+st.subheader("진행 요약")
+st.write(data.get("progress_summary") or "요약 생성 대기 중…")
+st.divider()
+
 # 안건 선택 UI
 pending = (data.get("pending_agenda") or {})
 needs_choice = bool(data.get("needs_agenda_choice"))
