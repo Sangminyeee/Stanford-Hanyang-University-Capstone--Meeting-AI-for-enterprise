@@ -39,6 +39,10 @@ def _ts_to_iso(ts: Optional[float]) -> Optional[str]:
 def _now_iso() -> str:
     return datetime.datetime.now().isoformat(timespec="seconds")
 
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOGS_DIR = os.path.join(CURRENT_DIR, "../log")
+REPORT_DIR = os.path.join(LOGS_DIR, "report")
+
 
 @dataclass
 class TranscriptLine:
@@ -265,6 +269,9 @@ class MeetingFlowAI:
     def __init__(
         self,
         summary_interval_sec: int = 60,
+        summary_window_sec: int = 180,
+        live_min_interval_sec: int = 180,
+        live_max_interval_sec: int = 300,
         topic_check_interval_sec: int = 20,
         propose_min_lines: int = 6,
         opinion_flush_interval_sec: int = 45,
@@ -274,6 +281,9 @@ class MeetingFlowAI:
         excerpt_lines: int = 400,
     ):
         self.summary_interval_sec = int(summary_interval_sec)
+        self.summary_window_sec = int(summary_window_sec)
+        self.live_min_interval_sec = int(live_min_interval_sec)
+        self.live_max_interval_sec = int(live_max_interval_sec)
         self.topic_check_interval_sec = int(topic_check_interval_sec)
         self.propose_min_lines = int(propose_min_lines)
         self.opinion_flush_interval_sec = int(opinion_flush_interval_sec)
@@ -298,6 +308,8 @@ class MeetingFlowAI:
         self._last_topic_check_at = 0.0
         self._last_summary_at = 0.0
         self._last_opinion_flush_at = 0.0
+        self._last_live_analysis_at = 0.0
+        self._last_spark_at = 0.0
 
         self._awaiting_agenda_choice = False
 
@@ -314,6 +326,17 @@ class MeetingFlowAI:
         self.decision_context_lines = 2
         self.decision_dedupe_sec = 45
         self.decision_log: Deque[dict] = deque(maxlen=200)
+
+        self.live_analysis = {
+            "ts": None,
+            "drift_score": None,
+            "drift_status": None,
+            "top_keywords": [],
+            "comparison_table": {},
+            "spark_question": None,
+        }
+        self.live_analysis_timeline: Deque[dict] = deque(maxlen=60)
+        self._last_keywords_set = set()
 
         self.f1_basic_info: Dict[str, Any] = {}
         self.f2_meeting_summary: Optional[str] = None
@@ -384,6 +407,12 @@ class MeetingFlowAI:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks = []
+        try:
+            report_path = await self.save_post_meeting_report()
+            if report_path:
+                print(f"\n[F4] Post-meeting report saved: {report_path}\n")
+        except Exception as e:
+            print(f"[F4] Report save error: {e}")
         print("\n[F4] MeetingFlowAI stopped.\n")
 
     async def _consumer_loop(self):
@@ -417,6 +446,7 @@ class MeetingFlowAI:
         self._last_summary_at = time.time()
         self._last_topic_check_at = time.time()
         self._last_opinion_flush_at = time.time()
+        self._last_live_analysis_at = time.time()
 
         while self._running:
             try:
@@ -430,6 +460,10 @@ class MeetingFlowAI:
                 if self.current_agenda and (now - self._last_topic_check_at >= self.topic_check_interval_sec):
                     await self._check_topic_shift()
                     self._last_topic_check_at = now
+
+                if (now - self._last_live_analysis_at) >= self._adaptive_live_interval():
+                    await self._run_live_analysis()
+                    self._last_live_analysis_at = now
 
             except asyncio.CancelledError:
                 break
@@ -448,8 +482,149 @@ class MeetingFlowAI:
             return "\n".join([strip_speaker_tag(txt) for _, _, txt in tail if txt.strip()])
         return "\n".join([f"[{spk}] {txt}" for _, spk, txt in tail])
 
+    def _adaptive_live_interval(self) -> int:
+        now = time.time()
+        recent = [x for x in self._recent_lines if (now - x[0]) <= 60]
+        if len(recent) >= 6:
+            return self.live_min_interval_sec
+        return self.live_max_interval_sec
+
+    def _keyword_weights(self, text: str, limit: int = 12) -> List[Dict[str, Any]]:
+        tokens = re.findall(r"[가-힣A-Za-z0-9]{2,}", text or "")
+        if not tokens:
+            return []
+        stop = {
+            "그리고", "그래서", "그런데", "저희", "우리", "여기", "거기", "이번",
+            "이것", "그것", "저것", "그냥", "사실", "말씀", "부분", "정도", "때문",
+            "회의", "안건", "관련", "검토", "논의",
+        }
+        freq: Dict[str, int] = {}
+        for t in tokens:
+            if t in stop:
+                continue
+            freq[t] = freq.get(t, 0) + 1
+        if not freq:
+            return []
+        top = sorted(freq.items(), key=lambda kv: (-kv[1], -len(kv[0]), kv[0]))[:limit]
+        max_f = max(1, top[0][1])
+        out = []
+        for word, f in top:
+            weight = int(round((f / max_f) * 100))
+            out.append({"word": word, "weight": weight})
+        return out
+
+    def _agenda_text(self) -> str:
+        if self.current_agenda and self.current_agenda.title:
+            return self.current_agenda.title
+        if isinstance(self.f3_agenda_info, dict):
+            parts = []
+            for v in self.f3_agenda_info.values():
+                if isinstance(v, str):
+                    parts.append(v)
+                elif isinstance(v, list):
+                    parts.extend([str(x) for x in v if isinstance(x, str)])
+            return " ".join(parts).strip()
+        return ""
+
+    def _topic_drift(self, dialog_text: str) -> Tuple[Optional[int], Optional[str]]:
+        agenda = self._agenda_text()
+        if not agenda or not dialog_text:
+            return None, None
+
+        def _tok(s: str) -> set:
+            return set(re.findall(r"[가-힣A-Za-z0-9]{2,}", s or ""))
+
+        a = _tok(agenda)
+        d = _tok(dialog_text)
+        if not a or not d:
+            return None, None
+        inter = len(a & d)
+        union = len(a | d)
+        sim = inter / max(1, union)
+        drift_score = int(round(sim * 100))
+        status = "ON_TRACK" if drift_score >= 60 else "DRIFTING"
+        return drift_score, status
+
+    async def _llm_comparison_table(self, window_text: str) -> Dict[str, Any]:
+        if not self.llm or not getattr(self.llm, "enabled", False):
+            return {}
+        system = "너는 회의 비교 분석 도우미다. 선택지 간 비교를 구조화한다."
+        user = (
+            "아래 전사에서 비교 논의(예: A vs B, 대안 비교, 장단점)를 찾아라.\n"
+            "비교가 없다면 빈 객체를 반환한다.\n\n"
+            f"[전사]\n{window_text}\n"
+        )
+        schema = '{"comparison_table": {"Option A": {"pros": [], "cons": [], "risks": []}}}'
+        out = await self.llm.json_call(system, user, schema)
+        if not out:
+            return {}
+        table = out.get("comparison_table") if isinstance(out, dict) else None
+        return table if isinstance(table, dict) else {}
+
+    async def _llm_spark_question(self, window_text: str) -> Optional[str]:
+        if not self.llm or not getattr(self.llm, "enabled", False):
+            return None
+        agenda = self._agenda_text() or "현재 안건"
+        system = "너는 회의 촉진자다. 막힌 대화를 확장하는 질문을 한 문장으로 제시한다."
+        user = (
+            f"현재 안건: {agenda}\n\n"
+            f"최근 전사:\n{window_text}\n\n"
+            "요구: 기존 발화와 다른 관점을 여는 질문 1문장."
+        )
+        schema = '{"spark_question": "질문 한 문장"}'
+        out = await self.llm.json_call(system, user, schema)
+        if not out:
+            return None
+        q = (out.get("spark_question") or "").strip()
+        return q or None
+
+    def _should_spark(self, window_text: str, keywords: List[Dict[str, Any]]) -> bool:
+        if not window_text.strip():
+            return False
+        if time.time() - self._last_spark_at < 180:
+            return False
+        idea_kw = ("아이디어", "대안", "제안", "옵션", "해보자")
+        detail_kw = ("구체", "디테일", "세부", "방법", "방안")
+        if any(k in window_text for k in idea_kw):
+            return False
+        if any(k in window_text for k in detail_kw):
+            return False
+
+        kw_set = {k["word"] for k in keywords if k.get("word")}
+        if not kw_set:
+            return True
+        overlap = len(kw_set & self._last_keywords_set) / max(1, len(kw_set | self._last_keywords_set))
+        self._last_keywords_set = kw_set
+        if overlap >= 0.8 and len(kw_set) <= 6:
+            return True
+        return False
+
+    async def _run_live_analysis(self):
+        window_text = self._window_text(seconds=self.summary_window_sec, strip_speaker=True)
+        drift_score, drift_status = self._topic_drift(window_text)
+        keywords = self._keyword_weights(window_text, limit=12)
+        comparison_table = await self._llm_comparison_table(window_text)
+
+        spark_question = None
+        if self._should_spark(window_text, keywords):
+            spark_question = await self._llm_spark_question(window_text)
+            if not spark_question:
+                spark_question = "만약 제약이 없다고 가정하면, 어떤 접근이 가능할까요?"
+            self._last_spark_at = time.time()
+
+        now_iso = _now_iso()
+        self.live_analysis = {
+            "ts": now_iso,
+            "drift_score": drift_score,
+            "drift_status": drift_status,
+            "top_keywords": keywords,
+            "comparison_table": comparison_table,
+            "spark_question": spark_question,
+        }
+        self.live_analysis_timeline.append(self.live_analysis)
+
     async def _emit_progress_summary(self):
-        w = self._window_text(seconds=self.summary_interval_sec * 2, strip_speaker=True)
+        w = self._window_text(seconds=self.summary_window_sec, strip_speaker=True)
         if not w.strip():
             return
         system = "너는 실시간 회의 서기다. 과장 없이, 현재 진행 상태를 한 문장으로 보고한다."
@@ -673,6 +848,48 @@ class MeetingFlowAI:
         extractor = Extractor(participants=participants)
         return extractor.extract_from_lines(lines, self.transcript)
 
+    def _signals_for_ui(self, lines: List[TranscriptLine]) -> Dict[str, List[Dict[str, Any]]]:
+        decision_kw = ("결정", "확정", "이걸로", "결론", "채택", "최종", "합의", "정하자")
+        task_kw = ("할게", "하겠습니다", "담당", "까지", "해야", "진행", "액션", "요청")
+        idea_kw = ("아이디어", "대안", "제안", "옵션", "해보자")
+        issue_kw = ("문제", "리스크", "우려", "막힘", "지연", "오류")
+        question_kw = ("질문", "궁금", "확인 필요")
+
+        decisions = []
+        tasks = []
+        ideas = []
+        issues = []
+        questions = []
+
+        for line in lines:
+            text = (line.text or "").strip()
+            if not text:
+                continue
+            entry = {
+                "t": line.ts_str(),
+                "speaker": line.speaker or "Unknown",
+                "text": text,
+            }
+
+            if any(k in text for k in decision_kw):
+                decisions.append(entry)
+            if any(k in text for k in task_kw):
+                tasks.append(entry)
+            if any(k in text for k in idea_kw):
+                ideas.append(entry)
+            if any(k in text for k in issue_kw):
+                issues.append(entry)
+            if "?" in text or any(k in text for k in question_kw):
+                questions.append(entry)
+
+        return {
+            "decisions": decisions,
+            "tasks": tasks,
+            "ideas": ideas,
+            "issues": issues,
+            "questions": questions,
+        }
+
     def _build_flow_timeline(self) -> List[dict]:
         if self.progress_timeline:
             return [{"ts": _ts_to_iso(ts), "text": txt} for ts, txt in list(self.progress_timeline)]
@@ -856,8 +1073,134 @@ class MeetingFlowAI:
             base = self._minutes_schema()
             base["meta"]["generated_at"] = _now_iso()
             base["meta"]["llm_used"] = False
-            base["meta"]["fallback_reason"] = "schema_repair"
+        base["meta"]["fallback_reason"] = "schema_repair"
         return base
+
+    def _alignment_fallback(self, agenda_items: List[dict]) -> List[dict]:
+        report = []
+        for item in agenda_items:
+            decisions = item.get("decisions") or []
+            issues = item.get("issues") or []
+            open_q = item.get("open_questions") or []
+            status = "DEFERRED"
+            if decisions:
+                status = "AGREED"
+            elif issues or open_q:
+                status = "CONFLICT"
+            report.append({
+                "agenda_id": item.get("agenda_id"),
+                "title": item.get("title"),
+                "status": status,
+                "reason": "heuristic",
+            })
+        return report
+
+    def _action_items_fallback(self, agenda_items: List[dict]) -> List[dict]:
+        out = []
+        for item in agenda_items:
+            tasks = item.get("tasks") or []
+            for t in tasks:
+                evidence = t.get("evidence") or []
+                context = evidence[0] if evidence else None
+                out.append({
+                    "task": t.get("text") or "",
+                    "assignee": t.get("assignee"),
+                    "due_date": t.get("due"),
+                    "context_link": context,
+                })
+        return out
+
+    def _layered_summary_fallback(self, agenda_items: List[dict]) -> Dict[str, Any]:
+        lines = []
+        for item in agenda_items[:3]:
+            title = item.get("title") or "안건"
+            summary = item.get("summary") or ""
+            line = f"{title}: {summary}".strip()
+            if line:
+                lines.append(line)
+        while len(lines) < 3:
+            lines.append("회의 요약 생성 대기 중입니다.")
+        discussion_flow = " ".join([item.get("summary") or "" for item in agenda_items if item.get("summary")]).strip()
+        if not discussion_flow:
+            discussion_flow = self.progress_summary or "회의 진행을 정리하는 중입니다."
+        return {
+            "executive_summary": lines[:3],
+            "discussion_flow": discussion_flow,
+        }
+
+    def _insight_metrics_fallback(self) -> Dict[str, Any]:
+        speaker_counts: Dict[str, int] = defaultdict(int)
+        for line in list(self.transcript._lines):
+            speaker_counts[line.speaker or "Unknown"] += 1
+        if speaker_counts:
+            dominant = max(speaker_counts.items(), key=lambda kv: kv[1])[0]
+        else:
+            dominant = None
+        return {
+            "speaker_distribution": dict(speaker_counts),
+            "dominant_speaker": dominant,
+            "agenda_count": len(self._agenda_list()),
+            "decision_count": len(self.decision_log),
+        }
+
+    async def _llm_post_meeting(self, base: dict) -> Optional[dict]:
+        if not self.llm or not getattr(self.llm, "enabled", False):
+            return None
+        system = "너는 회의 문서화 전문가다. 입력 JSON을 분석해 회의 종료 문서를 생성한다."
+        user = (
+            "아래 JSON을 참고해 정리된 보고서를 만들어라. "
+            "스키마를 반드시 지켜라.\n"
+            f"{json.dumps(base, ensure_ascii=False)}"
+        )
+        schema = json.dumps({
+            "alignment_report": [{"agenda_id": "", "title": "", "status": "AGREED|CONFLICT|DEFERRED", "reason": ""}],
+            "action_items": [{"task": "", "assignee": None, "due_date": None, "context_link": None}],
+            "layered_summary": {"executive_summary": ["", "", ""], "discussion_flow": ""},
+            "insight_metrics": {},
+        }, ensure_ascii=False)
+        out = await self.llm.json_call(system, user, schema)
+        if not isinstance(out, dict):
+            return None
+        return out
+
+    async def create_post_meeting_report(self) -> dict:
+        minutes = await self.create_meeting_minutes()
+        agenda_items = minutes.get("agenda_items") or []
+
+        base = {
+            "alignment_report": self._alignment_fallback(agenda_items),
+            "action_items": self._action_items_fallback(agenda_items),
+            "layered_summary": self._layered_summary_fallback(agenda_items),
+            "insight_metrics": self._insight_metrics_fallback(),
+        }
+
+        llm_out = await self._llm_post_meeting({
+            "agenda_items": agenda_items,
+            "meeting_text_excerpt": minutes.get("meeting_text", {}).get("excerpt", ""),
+            "signals": minutes.get("open_questions", []),
+            "decisions": minutes.get("agenda_items", []),
+        })
+        if llm_out:
+            for key in ["alignment_report", "action_items", "layered_summary", "insight_metrics"]:
+                if key in llm_out:
+                    base[key] = llm_out[key]
+
+        return {
+            "generated_at": _now_iso(),
+            "alignment_report": base["alignment_report"],
+            "action_items": base["action_items"],
+            "layered_summary": base["layered_summary"],
+            "insight_metrics": base["insight_metrics"],
+        }
+
+    async def save_post_meeting_report(self) -> Optional[str]:
+        os.makedirs(REPORT_DIR, exist_ok=True)
+        report = await self.create_post_meeting_report()
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(REPORT_DIR, f"report_{ts}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        return path
 
     def get_state(self) -> dict:
         current_agenda = None
@@ -891,7 +1234,12 @@ class MeetingFlowAI:
                 "summary": ag.running_summary,
             })
 
-        signals = self._extract_recent_signals()
+        recent_signal_lines = self.transcript.slice_by_abs_idx(
+            max(self.transcript.first_abs_idx, self.transcript.next_abs_idx - 60),
+            self.transcript.next_abs_idx - 1,
+        )
+        signals_ui = self._signals_for_ui(recent_signal_lines)
+        signals_detail = self._extract_recent_signals()
 
         return {
             "ts": _now_iso(),
@@ -902,7 +1250,10 @@ class MeetingFlowAI:
             "recent_tail": recent_lines,
             "decision_log": list(self.decision_log)[-20:],
             "agenda_history": agenda_history,
-            "signals": signals,
+            "signals": signals_ui,
+            "signals_detail": signals_detail,
+            "live_analysis": dict(self.live_analysis),
+            "live_analysis_timeline": list(self.live_analysis_timeline),
             "candidate_counts": {
                 "agenda_history": len(self.agenda_history),
                 "pending_candidates": len(self.pending_agenda.get("candidates", [])),

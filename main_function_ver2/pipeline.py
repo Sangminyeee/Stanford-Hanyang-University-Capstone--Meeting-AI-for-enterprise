@@ -97,7 +97,10 @@ class ObservableList(list):
 async def main():
     # F4
     flow_ai = MeetingFlowAI(
-        summary_interval_sec=20,  # 1) 특정 시간마다 요약
+        summary_interval_sec=180,  # 1) 특정 시간마다 요약 (3분)
+        summary_window_sec=180,  # 요약 컨텍스트 윈도우 (3분)
+        live_min_interval_sec=180,  # 라이브 분석 최소 주기
+        live_max_interval_sec=300,  # 라이브 분석 최대 주기
         topic_check_interval_sec=20,  # 2) 안건 변경 감지 템포
         propose_min_lines=6,  # 안건 후보 띄우기 최소 라인 수
         opinion_flush_interval_sec=45  # 3) 의견 정리 주기

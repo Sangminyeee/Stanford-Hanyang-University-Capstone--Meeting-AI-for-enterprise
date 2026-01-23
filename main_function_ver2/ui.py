@@ -1,4 +1,5 @@
 ﻿import time
+import html
 import requests
 import streamlit as st
 from datetime import datetime
@@ -72,15 +73,6 @@ html, body, [data-testid="stAppViewContainer"] {
   margin: 10px 0 12px 0;
 }
 
-.list-item {
-  padding: 6px 0;
-  border-bottom: 1px dashed #eef0f4;
-}
-
-.list-item:last-child {
-  border-bottom: none;
-}
-
 .topbar {
   background: #0b0d12;
   border: 1px solid var(--border);
@@ -108,12 +100,56 @@ html, body, [data-testid="stAppViewContainer"] {
   margin-bottom: 8px;
 }
 
-.stage {
-  background: linear-gradient(145deg, #141821, #0f1115);
+.chat ??? {
+}
+
+.chat-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.chat-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.chat-meta {
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.chat-bubble {
+  background: #1b2230;
   border: 1px solid var(--border);
-  border-radius: 18px;
-  padding: 12px;
-  min-height: 120px;
+  border-radius: 14px;
+  padding: 10px 12px;
+  line-height: 1.35;
+}
+
+.kw-chip {
+  display: inline-block;
+  background: #1f2a3a;
+  color: #d1d5db;
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  margin: 4px 6px 0 0;
+}
+
+.metric {
+  font-size: 1.2rem;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.metric-label {
+  font-size: 0.75rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
 }
 </style>
 """
@@ -159,7 +195,7 @@ def latest_summary(timeline: List[Dict[str, Any]]) -> str:
         last = timeline[-1].get("text")
         if last:
             return last
-    return "요약 생성 대기 중…"
+    return "?? ?? ?? ??"
 
 
 def extract_signals(tail: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
@@ -169,33 +205,32 @@ def extract_signals(tail: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]
     issues = []
     questions = []
 
-    decision_kw = ("결정", "확정", "이걸로", "결론", "채택", "최종", "합의", "정하자")
-    task_kw = ("할게", "하겠습니다", "담당", "까지", "해야", "진행", "액션", "요청")
-    idea_kw = ("아이디어", "대안", "제안", "옵션", "해보자")
-    issue_kw = ("문제", "리스크", "우려", "막힘", "지연", "오류")
-    question_kw = ("질문", "궁금", "확인 필요")
+    decision_kw = ("??", "??", "???", "??", "??", "??", "??", "???")
+    task_kw = ("??", "?????", "??", "??", "??", "??", "??", "??")
+    idea_kw = ("????", "??", "??", "??", "???")
+    issue_kw = ("??", "???", "??", "??", "??", "??")
+    question_kw = ("??", "??", "?? ??")
 
     for item in tail:
         text = (item.get("text") or "").strip()
         if not text:
             continue
 
-        lower = text
         entry = {
             "t": item.get("t"),
             "speaker": item.get("speaker", ""),
             "text": text,
         }
 
-        if any(k in lower for k in decision_kw):
+        if any(k in text for k in decision_kw):
             decisions.append(entry)
-        if any(k in lower for k in task_kw):
+        if any(k in text for k in task_kw):
             tasks.append(entry)
-        if any(k in lower for k in idea_kw):
+        if any(k in text for k in idea_kw):
             ideas.append(entry)
-        if any(k in lower for k in issue_kw):
+        if any(k in text for k in issue_kw):
             issues.append(entry)
-        if "?" in lower or any(k in lower for k in question_kw):
+        if "?" in text or any(k in text for k in question_kw):
             questions.append(entry)
 
     return {
@@ -207,19 +242,77 @@ def extract_signals(tail: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]
     }
 
 
-def group_by_speaker(tail: List[Dict[str, Any]], limit: int = 3) -> List[Tuple[str, List[str]]]:
-    buckets: Dict[str, List[str]] = {}
-    for item in tail:
-        spk = item.get("speaker", "Unknown") or "Unknown"
-        text = (item.get("text") or "").strip()
+def render_chat_transcript(tail: List[Dict[str, Any]]) -> None:
+    if not tail:
+        st.markdown("<span class='muted'>?? ??? ??</span>", unsafe_allow_html=True)
+        return
+
+    st.markdown("<div class='chat-wrap'>", unsafe_allow_html=True)
+    for item in tail[-60:]:
+        spk = html.escape(item.get("speaker", "Unknown") or "Unknown")
+        text = html.escape((item.get("text") or "").strip())
+        ts = html.escape(fmt_ts(item.get("t")))
         if not text:
             continue
-        buckets.setdefault(spk, []).append(text)
-    out = []
-    for spk, texts in buckets.items():
-        out.append((spk, texts[-limit:]))
-    out.sort(key=lambda x: (-len(x[1]), x[0]))
-    return out
+        st.markdown(
+            f"<div class='chat-row'>"
+            f"<div class='chat-meta'>{spk} ? {ts}</div>"
+            f"<div class='chat-bubble'>{text}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_live_analysis(live: Dict[str, Any]) -> None:
+    drift = live.get("drift_score")
+    status = live.get("drift_status")
+    spark = live.get("spark_question")
+    keywords = safe_list(live.get("top_keywords"))
+
+    st.markdown("<div class='panel-title'>Topic Drift</div>", unsafe_allow_html=True)
+    if drift is None:
+        st.markdown("<span class='muted'>?? ?? ?</span>", unsafe_allow_html=True)
+    else:
+        label = "ON_TRACK" if status == "ON_TRACK" else "DRIFTING"
+        badge_class = "badge-on" if status == "ON_TRACK" else "badge-off"
+        st.markdown(f"<div class='metric'>{drift}</div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<span class='badge {badge_class}'>{label}</span>",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
+    st.markdown("<div class='panel-title'>Keywords</div>", unsafe_allow_html=True)
+    if keywords:
+        for item in keywords[:12]:
+            word = html.escape(str(item.get("word", "")))
+            weight = item.get("weight", 0)
+            st.markdown(f"<span class='kw-chip'>{word} {weight}</span>", unsafe_allow_html=True)
+    else:
+        st.markdown("<span class='muted'>??? ??</span>", unsafe_allow_html=True)
+
+    if spark:
+        st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
+        st.markdown("<div class='panel-title'>Spark Question</div>", unsafe_allow_html=True)
+        st.write(spark)
+
+
+def render_comparison_table(table: Dict[str, Any]) -> None:
+    if not table:
+        st.markdown("<span class='muted'>?? ?? ??</span>", unsafe_allow_html=True)
+        return
+    for opt, data in table.items():
+        st.markdown(f"**{opt}**")
+        pros = safe_list(data.get("pros"))
+        cons = safe_list(data.get("cons"))
+        risks = safe_list(data.get("risks"))
+        if pros:
+            st.markdown("- Pros: " + ", ".join([str(x) for x in pros[:5]]))
+        if cons:
+            st.markdown("- Cons: " + ", ".join([str(x) for x in cons[:5]]))
+        if risks:
+            st.markdown("- Risks: " + ", ".join([str(x) for x in risks[:5]]))
 
 
 if "auto_refresh" not in st.session_state:
@@ -266,9 +359,9 @@ if not connected:
     st.stop()
 
 # Main layout
-left, center, right = st.columns([4, 4, 3])
+left, right = st.columns([7, 4])
 
-# Left column: transcript & summary
+# Left column: summary + chat
 with left:
     timeline = safe_list(data.get("progress_timeline"))
     tail = safe_list(data.get("recent_tail"))
@@ -279,43 +372,37 @@ with left:
     st.write(latest_summary(timeline))
     if timeline:
         st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
-        for item in timeline[-6:]:
+        for item in timeline[-4:]:
             st.write(f"[{fmt_ts(item.get('ts'))}] {item.get('text','')}")
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.markdown("<div class='panel-title'>Transcript</div>", unsafe_allow_html=True)
-    preview = safe_list(data.get("meeting_text_tail_preview"))
-    if preview:
-        for line in preview[-40:]:
-            st.write(line)
-    else:
-        if not tail:
-            st.markdown("<span class='muted'>전사 데이터 없음</span>", unsafe_allow_html=True)
-        for item in tail[-40:]:
-            st.write(f"[{fmt_ts(item.get('t'))}] [{item.get('speaker','')}] {item.get('text','')}")
+    render_chat_transcript(tail)
     st.markdown("</div>", unsafe_allow_html=True)
 
-# Center column: agenda / opinions / suggestions
-with center:
+# Right column: agenda + live analysis + actions
+with right:
     current_agenda = safe_dict(data.get("current_agenda"))
     pending_candidates = safe_list(data.get("pending_agenda_candidates"))
+    live = safe_dict(data.get("live_analysis"))
+    decision_log = safe_list(data.get("decision_log"))
 
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.markdown("<div class='panel-title'>Current Agenda</div>", unsafe_allow_html=True)
     if current_agenda:
         st.write(current_agenda.get("title", ""))
-        st.markdown(f"<span class='muted'>시작: {fmt_ts(current_agenda.get('started_at'))}</span>", unsafe_allow_html=True)
+        st.markdown(f"<span class='muted'>??: {fmt_ts(current_agenda.get('started_at'))}</span>", unsafe_allow_html=True)
         if current_agenda.get("ended_at"):
-            st.markdown(f"<br><span class='muted'>종료: {fmt_ts(current_agenda.get('ended_at'))}</span>", unsafe_allow_html=True)
+            st.markdown(f"<br><span class='muted'>??: {fmt_ts(current_agenda.get('ended_at'))}</span>", unsafe_allow_html=True)
         if current_agenda.get("status"):
-            st.markdown(f"<br><span class='muted'>상태: {current_agenda.get('status')}</span>", unsafe_allow_html=True)
+            st.markdown(f"<br><span class='muted'>??: {current_agenda.get('status')}</span>", unsafe_allow_html=True)
     else:
-        st.markdown("<span class='muted'>아직 안건이 선택되지 않았습니다.</span>", unsafe_allow_html=True)
+        st.markdown("<span class='muted'>?? ??? ???? ?????.</span>", unsafe_allow_html=True)
 
     if pending_candidates and not current_agenda:
         st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
-        st.write("안건 선택")
+        st.write("?? ??")
         cols = st.columns(3)
         for i in range(3):
             title = pending_candidates[i] if len(pending_candidates) > i else None
@@ -324,106 +411,49 @@ with center:
                     if st.button(title, key=f"agenda_btn_{i}", use_container_width=True):
                         try:
                             choose_agenda(title)
-                            st.success(f"안건 선택됨: {title}")
+                            st.success(f"?? ???: {title}")
                             st.rerun()
                         except Exception as e:
-                            st.error(f"안건 선택 전송 실패: {e}")
+                            st.error(f"?? ?? ?? ??: {e}")
                 else:
-                    st.button("—", disabled=True, use_container_width=True)
-    if signals["decisions"] or signals["tasks"]:
-        st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
-        if signals["decisions"]:
-            st.markdown("**Decisions in progress**")
-            for item in signals["decisions"][-3:]:
-                st.markdown(f"- {item.get('text','')}")
-        if signals["tasks"]:
-            st.markdown("**Action candidates**")
-            for item in signals["tasks"][-3:]:
-                spk = item.get("speaker", "")
-                txt = item.get("text", "")
-                if spk:
-                    st.markdown(f"- {spk}: {txt}")
-                else:
-                    st.markdown(f"- {txt}")
-
+                    st.button("?", disabled=True, use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown("<div class='panel-title'>Opinion Comparison</div>", unsafe_allow_html=True)
-    speaker_groups = group_by_speaker(tail, limit=2)
-    if speaker_groups:
-        for spk, texts in speaker_groups[:6]:
-            st.markdown(f"**{spk}**")
-            for t in texts:
-                st.markdown(f"- {t}")
-    else:
-        st.markdown("<span class='muted'>의견 비교 데이터 없음</span>", unsafe_allow_html=True)
+    st.markdown("<div class='panel-title'>Live Analysis</div>", unsafe_allow_html=True)
+    render_live_analysis(live)
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown("<div class='panel-title'>AI Suggestions</div>", unsafe_allow_html=True)
-    if pending_candidates:
-        for item in pending_candidates[:3]:
-            st.markdown(f"- {item}")
-    elif signals["issues"] or signals["questions"]:
-        for item in signals["issues"][-2:]:
-            st.markdown(f"- 리스크: {item.get('text','')}")
-        for item in signals["questions"][-2:]:
-            st.markdown(f"- 확인 필요: {item.get('text','')}")
-    else:
-        st.markdown("<span class='muted'>제안 데이터 없음</span>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-# Right column: assistant panel
-with right:
-    st.markdown("<div class='stage'>", unsafe_allow_html=True)
-    st.markdown("<div class='panel-title'>AI Assistant</div>", unsafe_allow_html=True)
-    st.markdown("<span class='muted'>회의 중 의사결정 지원</span>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    decision_log = safe_list(data.get("decision_log"))
-
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown("<div class='panel-title'>Ideas</div>", unsafe_allow_html=True)
-    if signals["ideas"]:
-        for item in signals["ideas"][-5:]:
-            st.markdown(f"- {item.get('text','')}")
-    elif signals["issues"]:
-        for item in signals["issues"][-3:]:
-            st.markdown(f"- {item.get('text','')}")
-    else:
-        st.markdown("<span class='muted'>아이디어 없음</span>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown("<div class='panel-title'>Options</div>", unsafe_allow_html=True)
-    if pending_candidates:
-        for item in pending_candidates[:5]:
-            st.markdown(f"- {item}")
-    elif signals["questions"]:
-        for item in signals["questions"][-5:]:
-            st.markdown(f"- {item.get('text','')}")
-    else:
-        st.markdown("<span class='muted'>옵션 없음</span>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown("<div class='panel-title'>Live Action Candidates</div>", unsafe_allow_html=True)
+    st.markdown("<div class='panel-title'>Decisions & Actions</div>", unsafe_allow_html=True)
     if decision_log:
         for d in decision_log[-5:]:
             spk = d.get("speaker", "")
             txt = d.get("text", "")
             st.markdown(f"- {spk}: {txt}")
-    elif signals["tasks"]:
+    elif signals.get("tasks"):
         for item in signals["tasks"][-5:]:
             spk = item.get("speaker", "")
             txt = item.get("text", "")
-            st.markdown(f"- {spk}: {txt}")
-    elif signals["decisions"]:
-        for item in signals["decisions"][-5:]:
-            st.markdown(f"- {item.get('text','')}")
+            st.markdown(f"- {spk}: {txt}" if spk else f"- {txt}")
     else:
-        st.markdown("<span class='muted'>액션 후보 없음</span>", unsafe_allow_html=True)
+        st.markdown("<span class='muted'>?? ?? ??</span>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.markdown("<div class='panel-title'>Comparison Table</div>", unsafe_allow_html=True)
+    render_comparison_table(live.get("comparison_table") if isinstance(live, dict) else {})
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.markdown("<div class='panel-title'>Risks & Questions</div>", unsafe_allow_html=True)
+    if signals.get("issues") or signals.get("questions"):
+        for item in signals.get("issues", [])[-3:]:
+            st.markdown(f"- ???: {item.get('text','')}")
+        for item in signals.get("questions", [])[-3:]:
+            st.markdown(f"- ?? ??: {item.get('text','')}")
+    else:
+        st.markdown("<span class='muted'>???/?? ??</span>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
 if st.session_state.auto_refresh and not st.session_state.paused:
