@@ -12,8 +12,28 @@ st.title("회의 흐름 대시보드 (F2 + F4)")
 refresh_sec = st.sidebar.slider("갱신 주기(초)", 1, 10, 2)
 auto = st.sidebar.checkbox("자동 갱신", value=True)
 
-def fmt_ts(ts: float) -> str:
-    return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+def fmt_ts(ts) -> str:
+    if ts is None:
+        return "--:--:--"
+    if isinstance(ts, (int, float)):
+        return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+    if isinstance(ts, str):
+        try:
+            return datetime.fromisoformat(ts).strftime("%H:%M:%S")
+        except Exception:
+            return ts
+    return str(ts)
+
+def progress_summary(data: dict) -> str:
+    s = data.get("progress_summary")
+    if s:
+        return s
+    timeline = data.get("progress_timeline") or []
+    if timeline:
+        last = timeline[-1].get("text")
+        if last:
+            return last
+    return "요약 생성 대기 중…"
 
 def fetch_state():
     r = requests.get(STATE_URL, timeout=1.5)
@@ -32,17 +52,21 @@ except Exception as e:
     st.stop()
 
 st.subheader("진행 요약")
-st.write(data.get("progress_summary") or "요약 생성 대기 중…")
+st.write(progress_summary(data))
+timeline = data.get("progress_timeline") or []
+if timeline:
+    with st.expander("타임라인", expanded=False):
+        for item in timeline[-10:]:
+            st.write(f"[{fmt_ts(item.get('ts'))}] {item.get('text','')}")
 st.divider()
 
 # 안건 선택 UI
-pending = (data.get("pending_agenda") or {})
-needs_choice = bool(data.get("needs_agenda_choice"))
+pending_candidates = data.get("pending_agenda_candidates") or []
+needs_choice = bool(pending_candidates) and not data.get("current_agenda")
 
 if needs_choice:
-    st.warning(f"안건 선택이 필요합니다. (사유: {pending.get('reason','')})")
-
-    cands = pending.get("candidates") or []
+    st.warning("안건 선택이 필요합니다.")
+    cands = pending_candidates
 
     btn_titles = [
         cands[0] if len(cands) > 0 else None,
@@ -88,9 +112,14 @@ if needs_choice:
 st.divider()
 
 st.subheader("최근 전사")
-tail = data.get("f2_recent_tail") or []
-for x in tail[-40:]:
-    st.write(x["line"])
+tail_preview = data.get("meeting_text_tail_preview") or []
+if tail_preview:
+    for line in tail_preview:
+        st.write(line)
+else:
+    tail = data.get("recent_tail") or []
+    for x in tail[-40:]:
+        st.write(f"[{fmt_ts(x.get('t'))}] [{x.get('speaker','')}] {x.get('text','')}")
 
 ag = data.get("current_agenda")
 
@@ -129,31 +158,37 @@ with col1:
     if not ag:
         st.info("아직 안건이 선택되지 않았습니다.")
     else:
-        st.markdown(f"### {ag['title']}")
-        st.caption(f"시작: {fmt_ts(ag['started_at'])}")
-        st.write(ag.get("running_summary") or "")
-
-        st.markdown("**결정**")
-        st.write(ag.get("decisions") or [])
-
-        st.markdown("**할일**")
-        st.write(ag.get("todos") or [])
+        st.markdown(f"### {ag.get('title','')}")
+        st.caption(f"시작: {fmt_ts(ag.get('started_at'))}")
+        if ag.get("ended_at"):
+            st.caption(f"종료: {fmt_ts(ag.get('ended_at'))}")
+        if ag.get("status"):
+            st.write(f"상태: {ag.get('status')}")
 
 with col2:
-    st.subheader("의견(화자별)")
-    if ag and ag.get("opinions_by_speaker"):
-        for spk, ops in ag["opinions_by_speaker"].items():
-            with st.expander(spk, expanded=False):
-                for op in ops:
-                    st.write(f"- {op}")
+    st.subheader("안건 히스토리")
+    history = data.get("agenda_history") or []
+    if not history:
+        st.write("히스토리 없음")
     else:
-        st.write("의견 데이터 없음")
+        for item in reversed(history[-10:]):
+            title = item.get("title", "")
+            status = item.get("status", "")
+            started = fmt_ts(item.get("started_at"))
+            ended = fmt_ts(item.get("ended_at")) if item.get("ended_at") else ""
+            header = f"{title} ({status})"
+            with st.expander(header, expanded=False):
+                st.write(f"시작: {started}")
+                if ended:
+                    st.write(f"종료: {ended}")
+                if item.get("summary"):
+                    st.write(item.get("summary"))
 
 st.divider()
 st.subheader("최근 전사 (tail)")
 tail = data.get("recent_tail") or []
 for x in tail[-40:]:
-    st.write(f"[{fmt_ts(x['t'])}] [{x['speaker']}] {x['text']}")
+    st.write(f"[{fmt_ts(x.get('t'))}] [{x.get('speaker','')}] {x.get('text','')}")
 
 if auto:
     time.sleep(refresh_sec)

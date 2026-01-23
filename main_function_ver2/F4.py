@@ -11,9 +11,8 @@ from typing import Deque, Dict, List, Optional, Tuple, Any
 from google import genai
 from google.genai import types
 
-# 내용 요약할때 최근 내용만 요약하게 기존 전사 내용 요약
+
 LINE_RE = re.compile(r"^\s*\[(?P<speaker>[^\]]+)\]\s*(?P<text>.+?)\s*$")
-# 앞에 화자 태그 제거
 BRACKET_SPK_RE = re.compile(r"^\s*\[[^\]]+\]\s*")
 
 
@@ -23,15 +22,112 @@ def parse_transcript_line(line: str) -> Tuple[str, str]:
         return "Unknown", (line or "").strip()
     return m.group("speaker").strip(), m.group("text").strip()
 
-def now_hhmm() -> str:
-    return datetime.datetime.now().strftime("%H:%M")
 
 def strip_speaker_tag(line: str) -> str:
-    # "[speaker1] 내용" -> "내용"
     return BRACKET_SPK_RE.sub("", (line or "")).strip()
-# -----------------------------
-# LLM 클라이언트 (Gemini + fallback)
-# -----------------------------
+
+
+def _ts_to_iso(ts: Optional[float]) -> Optional[str]:
+    if ts is None:
+        return None
+    try:
+        return datetime.datetime.fromtimestamp(float(ts)).isoformat(timespec="seconds")
+    except Exception:
+        return None
+
+
+def _now_iso() -> str:
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+@dataclass
+class TranscriptLine:
+    abs_idx: int
+    ts: Optional[float]
+    speaker: str
+    text: str
+    raw_line: str
+
+    def ts_str(self) -> Optional[str]:
+        return _ts_to_iso(self.ts)
+
+
+class TranscriptStore:
+    def __init__(self, max_full_lines: int = 20000, excerpt_lines: int = 400):
+        self.max_full_lines = max_full_lines
+        self.excerpt_lines = excerpt_lines
+        self._lines: Deque[TranscriptLine] = deque(maxlen=max_full_lines)
+        self._next_abs_idx = 0
+        self._first_abs_idx = 0
+
+    def add(self, ts: Optional[float], speaker: str, text: str, raw_line: str) -> TranscriptLine:
+        abs_idx = self._next_abs_idx
+        self._next_abs_idx += 1
+        if len(self._lines) == self._lines.maxlen:
+            self._first_abs_idx += 1
+        line = TranscriptLine(abs_idx=abs_idx, ts=ts, speaker=speaker, text=text, raw_line=raw_line)
+        self._lines.append(line)
+        return line
+
+    def full_text(self) -> str:
+        return "\n".join([l.raw_line for l in self._lines])
+
+    def excerpt_text(self) -> str:
+        tail = list(self._lines)[-self.excerpt_lines :]
+        return "\n".join([l.raw_line for l in tail])
+
+    def tail_preview(self, n: int = 5) -> List[str]:
+        return [l.raw_line for l in list(self._lines)[-n:]]
+
+    def get_line_by_abs_idx(self, abs_idx: int) -> Optional[TranscriptLine]:
+        if abs_idx < self._first_abs_idx:
+            return None
+        local = abs_idx - self._first_abs_idx
+        if local < 0 or local >= len(self._lines):
+            return None
+        return list(self._lines)[local]
+
+    def slice_by_abs_idx(self, start_abs: Optional[int], end_abs: Optional[int]) -> List[TranscriptLine]:
+        if start_abs is None and end_abs is None:
+            return list(self._lines)
+        if start_abs is None:
+            start_abs = self._first_abs_idx
+        if end_abs is None:
+            end_abs = self._next_abs_idx - 1
+        if end_abs < start_abs:
+            return []
+        out = []
+        for line in self._lines:
+            if line.abs_idx < start_abs:
+                continue
+            if line.abs_idx > end_abs:
+                break
+            out.append(line)
+        return out
+
+    def evidence_snippet(self, abs_idx: int, max_lines: int = 3) -> List[str]:
+        idxs = [abs_idx - 1, abs_idx, abs_idx + 1]
+        out = []
+        for i in idxs[:max_lines]:
+            line = self.get_line_by_abs_idx(i)
+            if not line:
+                continue
+            ts = line.ts_str()
+            if ts:
+                out.append(f"[{ts}] [{line.speaker}] {line.text}")
+            else:
+                out.append(f"[{line.speaker}] {line.text}")
+        return out
+
+    @property
+    def next_abs_idx(self) -> int:
+        return self._next_abs_idx
+
+    @property
+    def first_abs_idx(self) -> int:
+        return self._first_abs_idx
+
+
 class LLMClient:
     def __init__(self, model_name: str):
         self.model_name = model_name
@@ -40,9 +136,6 @@ class LLMClient:
         self._client = genai.Client(api_key=self.api_key) if self.enabled else None
 
     async def json_call(self, system: str, user: str, schema_hint: str) -> Optional[dict]:
-        """
-        JSON만 받는 호출. 실패하면 None.
-        """
         if not self.enabled:
             return None
 
@@ -59,10 +152,9 @@ class LLMClient:
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     temperature=0.2,
-                )
+                ),
             )
             txt = (resp.text or "").strip()
-            # 방어적 클리닝
             if txt.startswith("```json"):
                 txt = txt[7:].strip()
             if txt.endswith("```"):
@@ -75,41 +167,111 @@ class LLMClient:
             return None
 
 
-# -----------------------------
-# 데이터 모델
-# -----------------------------
 @dataclass
-class AgendaItem:
+class AgendaSegment:
+    agenda_id: str
     title: str
-    started_at: float = field(default_factory=lambda: time.time())
-    # 누적 요약 / 의견
+    started_at: Optional[float] = None
+    ended_at: Optional[float] = None
+    status: str = "in_progress"
+    start_abs_idx: Optional[int] = None
+    end_abs_idx: Optional[int] = None
     running_summary: str = ""
-    opinions_by_speaker: Dict[str, List[str]] = field(default_factory=lambda: defaultdict(list))
-    decisions: List[str] = field(default_factory=list)
-    todos: List[str] = field(default_factory=list)
 
-# 결정으로 보이는 발언 캡쳐용
-@dataclass
-class DecisionLogItem:
-    t: float
-    speaker: str
-    text: str
-    agenda: str
-    evidence: List[dict]
-    confidence: float = 0.6
 
-# -----------------------------
-# 핵심: 실시간 회의 흐름 AI
-# -----------------------------
+class Extractor:
+    DECISION_KW = ["결정", "확정", "이걸로", "결론", "채택", "최종"]
+    TASK_KW = ["할게", "하겠습니다", "담당", "까지", "해야", "진행", "액션"]
+    IDEA_KW = ["아이디어", "대안", "제안", "옵션", "해보자"]
+    ISSUE_KW = ["문제", "리스크", "우려", "막힘", "지연", "오류"]
+    QUESTION_KW = ["질문", "궁금", "확인 필요"]
+
+    DATE_PATTERNS = [
+        re.compile(r"\b\d{4}-\d{2}-\d{2}\b"),
+        re.compile(r"\b\d{1,2}/\d{1,2}\b"),
+        re.compile(r"(오늘|내일|모레|이번주|다음주)"),
+    ]
+
+    def __init__(self, participants: Optional[List[str]] = None):
+        self.participants = participants or []
+
+    def _match_any(self, text: str, keywords: List[str]) -> bool:
+        return any(k in text for k in keywords)
+
+    def _infer_owner(self, text: str) -> Optional[str]:
+        for p in self.participants:
+            if p and p in text:
+                return p
+        return None
+
+    def _infer_due(self, text: str) -> Optional[str]:
+        for pat in self.DATE_PATTERNS:
+            m = pat.search(text)
+            if m:
+                return m.group(0)
+        return None
+
+    def extract_from_lines(
+        self,
+        lines: List[TranscriptLine],
+        store: TranscriptStore,
+    ) -> Dict[str, Any]:
+        decisions = []
+        tasks = []
+        ideas = []
+        issues = []
+        open_questions = []
+
+        for line in lines:
+            text = line.text
+            if not text:
+                continue
+
+            if self._match_any(text, self.DECISION_KW):
+                decisions.append({
+                    "text": text,
+                    "owner": self._infer_owner(text),
+                    "evidence": store.evidence_snippet(line.abs_idx),
+                })
+
+            if self._match_any(text, self.TASK_KW):
+                tasks.append({
+                    "text": text,
+                    "assignee": self._infer_owner(text),
+                    "due": self._infer_due(text),
+                    "status": "todo",
+                    "evidence": store.evidence_snippet(line.abs_idx),
+                })
+
+            if self._match_any(text, self.IDEA_KW):
+                ideas.append(text)
+
+            if self._match_any(text, self.ISSUE_KW):
+                issues.append(text)
+
+            if "?" in text or self._match_any(text, self.QUESTION_KW):
+                open_questions.append(text)
+
+        return {
+            "decisions": decisions,
+            "tasks": tasks,
+            "ideas": ideas,
+            "issues": issues,
+            "open_questions": open_questions,
+        }
+
+
 class MeetingFlowAI:
     def __init__(
-            self,
-            summary_interval_sec: int = 60,
-            topic_check_interval_sec: int = 20,
-            propose_min_lines: int = 6,
-            opinion_flush_interval_sec: int = 45,
-            llm_model_name: str = None,
-            window_max_lines: int = 200,
+        self,
+        summary_interval_sec: int = 60,
+        topic_check_interval_sec: int = 20,
+        propose_min_lines: int = 6,
+        opinion_flush_interval_sec: int = 45,
+        llm_model_name: str = None,
+        window_max_lines: int = 200,
+        max_full_lines: int = 20000,
+        excerpt_lines: int = 400,
     ):
         self.summary_interval_sec = int(summary_interval_sec)
         self.topic_check_interval_sec = int(topic_check_interval_sec)
@@ -119,28 +281,26 @@ class MeetingFlowAI:
 
         self.llm = LLMClient(model_name=(llm_model_name or os.getenv("F4_GEMINI_MODEL") or "gemini-1.5-flash"))
 
-        self._queue: asyncio.Queue[str] = asyncio.Queue()
+        self._queue: asyncio.Queue[Tuple[Optional[float], str, str, str]] = asyncio.Queue()
         self._running = False
         self._tasks: List[asyncio.Task] = []
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._pending_buffer: Deque[Tuple[Optional[float], str, str, str]] = deque(maxlen=2000)
 
-        # 최근 전사 윈도우
         self._recent_lines: Deque[Tuple[float, str, str]] = deque(maxlen=self.window_max_lines)
-        # (ts, speaker, text)
 
-        # 안건/상태
-        self.current_agenda: Optional[AgendaItem] = None
-        self.agenda_history: List[AgendaItem] = []
+        self.transcript = TranscriptStore(max_full_lines=max_full_lines, excerpt_lines=excerpt_lines)
 
-        # 안건 후보 제시 쿨다운
+        self.current_agenda: Optional[AgendaSegment] = None
+        self.agenda_history: List[AgendaSegment] = []
+
         self._last_propose_at = 0.0
         self._last_topic_check_at = 0.0
         self._last_summary_at = 0.0
         self._last_opinion_flush_at = 0.0
 
-        # 안건 선택/변경 중복 방지
         self._awaiting_agenda_choice = False
 
-        # UI에서 선택할 안건 후보
         self.pending_agenda = {
             "candidates": [],
             "reason": "",
@@ -150,25 +310,61 @@ class MeetingFlowAI:
         self.progress_summary = ""
         self.progress_timeline = deque(maxlen=50)
 
-        # 결정 로그
-        self.decision_log: Deque[DecisionLogItem] = deque(maxlen=200)
-
-        # 같은 결정 중복 방지용
         self._decision_dedupe: Dict[str, float] = {}
+        self.decision_context_lines = 2
+        self.decision_dedupe_sec = 45
 
-        # 파라미터
-        self.decision_context_lines = 2 # 근거 부분 몇줄
-        self.decision_dedupe_sec = 45 # 중복 방지용 시간설정
+        self.f1_basic_info: Dict[str, Any] = {}
+        self.f2_meeting_summary: Optional[str] = None
+        self.f3_agenda_info: Optional[dict] = None
 
-        # 외부(연결파일)에서 호출
-    def push_transcript_line(self, line: str):
-        # queue.put_nowait는 event loop에서만 안전 -> 연결파일에서 call_soon_threadsafe로 호출하도록 설계함
-        self._queue.put_nowait(line)
+    def update_basic_info(self, info: dict):
+        if isinstance(info, dict):
+            self.f1_basic_info = info
+
+    def update_f2_summary(self, summary: str):
+        if isinstance(summary, str):
+            self.f2_meeting_summary = summary.strip()
+
+    def update_f3_agenda_info(self, info: dict):
+        if isinstance(info, dict):
+            self.f3_agenda_info = info
+
+    def _enqueue_line(self, payload: Tuple[Optional[float], str, str, str]):
+        if self._loop and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._queue.put_nowait, payload)
+        else:
+            self._pending_buffer.append(payload)
+
+    def push_transcript_line(self, line: str, ts: Optional[str] = None, speaker: Optional[str] = None):
+        raw_line = line or ""
+        text = raw_line
+        spk = speaker
+        if speaker:
+            raw_line = f"[{speaker}] {line}"
+        if not speaker:
+            spk, text = parse_transcript_line(raw_line)
+        else:
+            text = line
+
+        ts_val: Optional[float] = None
+        if ts:
+            try:
+                ts_val = float(ts)
+            except Exception:
+                ts_val = None
+        if ts_val is None:
+            ts_val = time.time()
+
+        self._enqueue_line((ts_val, spk or "Unknown", text.strip(), raw_line.strip()))
 
     async def start(self):
         if self._running:
             return
         self._running = True
+        self._loop = asyncio.get_running_loop()
+        while self._pending_buffer:
+            self._queue.put_nowait(self._pending_buffer.popleft())
         self._tasks = [
             asyncio.create_task(self._consumer_loop()),
             asyncio.create_task(self._periodic_loop()),
@@ -179,30 +375,28 @@ class MeetingFlowAI:
         if not self._running:
             return
         self._running = False
+        if self.current_agenda and self.current_agenda.ended_at is None:
+            self.current_agenda.ended_at = time.time()
+            self.current_agenda.status = "completed"
+            self.current_agenda.end_abs_idx = self.transcript.next_abs_idx - 1
         for t in self._tasks:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks = []
         print("\n[F4] MeetingFlowAI stopped.\n")
 
-    # -----------------------------
-    # 메인: 전사 라인 소비
-    # -----------------------------
     async def _consumer_loop(self):
         while self._running:
             try:
-                line = await self._queue.get()
-                ts = time.time()
-                speaker, text = parse_transcript_line(line)
-
+                ts, speaker, text, raw_line = await self._queue.get()
                 if not text:
                     continue
-
+                line = self.transcript.add(ts, speaker, text, raw_line)
                 self._recent_lines.append((ts, speaker, text))
-                # 결정 로그 감지
-                self._maybe_capture_decision(ts, speaker, text)
 
-                # 안건이 아직 없고 충분히 쌓였으면 후보 제시
+                if self.current_agenda:
+                    self.current_agenda.end_abs_idx = line.abs_idx
+
                 if (self.current_agenda is None) and (len(self._recent_lines) >= self.propose_min_lines):
                     await self._propose_and_choose_agenda(reason="초기 안건 설정")
 
@@ -216,9 +410,6 @@ class MeetingFlowAI:
                 except Exception:
                     pass
 
-    # -----------------------------
-    # 주기 루프: 요약/안건 변경감지/의견정리
-    # -----------------------------
     async def _periodic_loop(self):
         self._last_summary_at = time.time()
         self._last_topic_check_at = time.time()
@@ -229,101 +420,19 @@ class MeetingFlowAI:
                 await asyncio.sleep(0.5)
                 now = time.time()
 
-                # 1) 주기 요약
                 if self.current_agenda and (now - self._last_summary_at >= self.summary_interval_sec):
                     await self._emit_progress_summary()
                     self._last_summary_at = now
 
-                # 2) 안건 변경 감지 (LLM 기반 + 휴리스틱)
                 if self.current_agenda and (now - self._last_topic_check_at >= self.topic_check_interval_sec):
                     await self._check_topic_shift()
                     self._last_topic_check_at = now
-
-                # 3) 의견/정리 flush
-                if self.current_agenda and (now - self._last_opinion_flush_at >= self.opinion_flush_interval_sec):
-                    await self._flush_opinions_and_updates()
-                    self._last_opinion_flush_at = now
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 print(f"[F4] periodic error: {e}")
 
-    # ---------------------------------
-    # 결정 감지용
-    _DECISION_PATTERNS = [
-        r"\b결정(하|됐|되었|합니다|하자|하기로)\b",
-        r"\b확정(하|됐|되었|합니다|하자|하기로)\b",
-        r"\b합의(하|됐|되었|합니다|하자|하기로)\b",
-        r"\b정하(자|죠|겠습니다|기로)\b",
-        r"\b채택(하|됐|하기로)\b",
-        r"\b그렇게\s*하(자|죠|겠습니다)\b",
-        r"\b오케이\b",
-        r"\bOK\b",
-        r"\b콜\b",
-        r"\b가시죠\b",
-        r".+로\s*(하자|가자|결정|확정|정하자)",
-    ]
-
-    _DECISION_RE = re.compile("|".join(f"(?:{p})" for p in _DECISION_PATTERNS), re.IGNORECASE)
-
-    def _norm_for_dedupe(self, s: str) -> str:
-        s = (s or "").strip().lower()
-        s = re.sub(r"\s+", " ", s)
-        s = re.sub(r"[\"'`]", "", s)
-        return s[:200]
-
-    # 주변 문장 스니펫
-    def _get_context_snippet(self, center_idx: int) -> List[dict]:
-        items = list(self._recent_lines)
-        if not items:
-            return []
-        lo = max(0, center_idx - self.decision_context_lines)
-        hi = min(len(items), center_idx + self.decision_context_lines + 1)
-        out = []
-        for ts, spk, txt in items[lo:hi]:
-            out.append({"t": ts, "speaker": spk, "text": txt})
-        return out
-
-    # 결정 발언 로그에 추가
-    def _maybe_capture_decision(self, ts: float, speaker: str, text: str):
-        if not text or len(text) < 4:
-            return
-
-        if not self._DECISION_RE.search(text):
-            return
-
-        key = self._norm_for_dedupe(text)
-        last = self._decision_dedupe.get(key, 0.0)
-        if ts - last < self.decision_dedupe_sec:
-            return
-        self._decision_dedupe[key] = ts
-
-        center_idx = len(self._recent_lines) - 1
-        evidence = self._get_context_snippet(center_idx)
-
-        agenda_title = self.current_agenda.title if self.current_agenda else "Unassigned"
-
-        item = DecisionLogItem(
-            t=ts,
-            speaker=speaker,
-            text=text.strip(),
-            agenda=agenda_title,
-            evidence=evidence,
-            confidence=0.6,
-        )
-        self.decision_log.append(item)
-
-        # 안건 있으면 decision에도 넣기
-        if self.current_agenda:
-            if item.text not in self.current_agenda.decisions:
-                self.current_agenda.decisions.append(item.text)
-
-        print(f"\n[F4][결정로그 {now_hhmm()}] ({agenda_title}) {speaker}: {item.text}\n")
-
-    # -----------------------------
-    # 텍스트 윈도우 만들기
-    # -----------------------------
     def _window_text(self, seconds: Optional[int] = None, strip_speaker: bool = False) -> str:
         if not self._recent_lines:
             return ""
@@ -331,22 +440,15 @@ class MeetingFlowAI:
         items = list(self._recent_lines)
         if seconds is not None:
             items = [x for x in items if (now - x[0]) <= seconds]
-        # 너무 길면 최근 위주로 자르기
-        tail = items[-120:]  # 안전 상한
-
+        tail = items[-120:]
         if strip_speaker:
             return "\n".join([strip_speaker_tag(txt) for _, _, txt in tail if txt.strip()])
-        else:
-            return "\n".join([f"[{spk}] {txt}" for _, spk, txt in tail])
+        return "\n".join([f"[{spk}] {txt}" for _, spk, txt in tail])
 
-    # -----------------------------
-    # 1) 특정 시간마다 요약: "~~~하는 중입니다"
-    # -----------------------------
     async def _emit_progress_summary(self):
         w = self._window_text(seconds=self.summary_interval_sec * 2, strip_speaker=True)
         if not w.strip():
             return
-
         system = "너는 실시간 회의 서기다. 과장 없이, 현재 진행 상태를 한 문장으로 보고한다."
         user = (
             f"최근 전사:\n{w}\n\n"
@@ -359,37 +461,20 @@ class MeetingFlowAI:
 
         out = None
         if self.llm and getattr(self.llm, "enabled", False):
-            out = self.llm.json_call(system=system, user=user, schema_hint='{"progress":"..."}')
+            out = await self.llm.json_call(system=system, user=user, schema_hint='{"progress":"..."}')
 
         progress = ""
-
         if isinstance(out, dict):
             progress = (out.get("progress") or "").strip()
-
         if not progress:
-            # 안건 없이도 계속 요약되게
             progress = "현재 회의 내용을 정리하는 중입니다."
 
         self.progress_summary = progress
         self.progress_timeline.append((time.time(), progress))
 
-        print(f"\n[F4][진행요약 {now_hhmm()}] {progress}\n")
-
-        # 누적 요약에도 반영(짧게)
-        if self.current_agenda:
-            if self.current_agenda.running_summary:
-                self.current_agenda.running_summary += " " + progress
-            else:
-                self.current_agenda.running_summary = progress
-
-    # -----------------------------
-    # 2) 안건 후보 제시/선택 (3개 후보)
-    # -----------------------------
     async def _propose_and_choose_agenda(self, reason: str):
         if self._awaiting_agenda_choice:
             return
-
-        # 너무 자주 후보 띄우지 않게
         now = time.time()
         if now - self._last_propose_at < 15:
             return
@@ -403,26 +488,19 @@ class MeetingFlowAI:
         if not candidates:
             candidates = self._fallback_candidates(w)
 
-        # UI에서 pending에 저장
         self.pending_agenda = {
             "candidates": candidates[:3],
             "reason": reason,
             "created_at": time.time(),
         }
 
-        print("\n" + "=" * 62)
-        print(f"[F4] 안건 후보 생성 / 사유: {reason}")
-        for i, c in enumerate(self.pending_agenda["candidates"], 1):
-            print(f"  {i}) {c}")
-        print("=" * 62 + "\n")
-    
-    # 안건 고르는거
+    async def propose_agenda_now(self, reason: str = "manual"):
+        await self._propose_and_choose_agenda(reason=reason)
+
     async def choose_agenda(self, title: str):
         title = (title or "").strip()
         if not title:
             return
-
-        # pending 비우고 전환
         self.pending_agenda = {"candidates": [], "reason": "", "created_at": 0.0}
         await self._switch_agenda(title, reason="UI 선택")
 
@@ -451,72 +529,76 @@ class MeetingFlowAI:
         return cleaned[:3]
 
     def _fallback_candidates(self, window_text: str) -> List[str]:
-        # 간단 휴리스틱: 많이 나오는 명사/키워드 기반(아주 단순)
-        # (외부 라이브러리 없이)
-        words = re.findall(r"[가-힣A-Za-z0-9]{2,}", window_text)
-        freq = defaultdict(int)
-        for w in words:
-            freq[w] += 1
-        top = sorted(freq.items(), key=lambda kv: (-kv[1], -len(kv[0])))[:12]
-        base = [w for w, _ in top]
-        # 3개 후보 만들기
-        c1 = base[0] if len(base) > 0 else "진행사항"
-        c2 = base[1] if len(base) > 1 else "이슈정리"
-        c3 = base[2] if len(base) > 2 else "다음액션"
-        return [c1, c2, c3]
+        candidates = []
+        lines = [l.strip() for l in window_text.splitlines() if l.strip()]
+        agenda_markers = ["안건", "주제", "논의", "이슈", "목표", "agenda", "topic", "issue"]
 
-    async def _ask_user_choose_agenda(self, candidates: List[str], reason: str) -> str:
-        # 사용자 입력은 블로킹이므로 to_thread
-        def _input_choice() -> str:
-            print("\n" + "=" * 62)
-            print(f"[F4] 안건 후보 제안 ({reason})")
-            for i, c in enumerate(candidates, 1):
-                print(f"  {i}) {c}")
-            print("  0) (직접 입력)")
-            print("=" * 62)
-            while True:
-                s = input("[F4] 지금 안건 번호 선택 (1-3, 0=직접입력): ").strip()
-                if s in ("1", "2", "3"):
-                    return candidates[int(s) - 1]
-                if s == "0":
-                    t = input("[F4] 안건 제목 직접 입력: ").strip()
-                    if t:
-                        return t
-                print("[F4] 입력이 올바르지 않습니다.")
+        def _clean_title(s: str) -> str:
+            s = re.sub(r"^\s*[\-\*\d\.\)]\s*", "", s)
+            s = re.sub(r"^\s*(안건|주제|논의|이슈|목표)\s*[:\-]?\s*", "", s, flags=re.IGNORECASE)
+            s = re.sub(r"\s+", " ", s).strip()
+            if len(s) > 40:
+                s = s[:40].rstrip()
+            return s
 
-        return await asyncio.to_thread(_input_choice)
+        for line in lines:
+            if any(m in line for m in agenda_markers):
+                title = _clean_title(line)
+                if 4 <= len(title) <= 40 and title not in candidates:
+                    candidates.append(title)
+
+        for line in lines:
+            m = re.search(r"(.{2,30}?)(?:에 대해|관련|진행|검토|논의)", line)
+            if m:
+                title = _clean_title(m.group(1))
+                if 4 <= len(title) <= 40 and title not in candidates:
+                    candidates.append(title)
+
+        if len(candidates) < 3:
+            words = re.findall(r"[가-힣A-Za-z0-9]{2,}", window_text)
+            freq = defaultdict(int)
+            for w in words:
+                freq[w] += 1
+            top = sorted(freq.items(), key=lambda kv: (-kv[1], -len(kv[0])))[:8]
+            base = [w for w, _ in top if len(w) >= 2]
+            for w in base:
+                if w not in candidates and len(candidates) < 6:
+                    candidates.append(w)
+
+        if not candidates:
+            return ["진행사항", "이슈정리", "다음액션"]
+        return candidates[:3]
 
     async def _switch_agenda(self, title: str, reason: str):
         title = (title or "").strip()
         if not title:
             return
-
-        # 동일 안건이면 무시
         if self.current_agenda and self.current_agenda.title == title:
             return
 
-        # 기존 안건 마감 전 flush
         if self.current_agenda:
-            await self._flush_opinions_and_updates()
+            self.current_agenda.ended_at = time.time()
+            self.current_agenda.status = "completed"
+            self.current_agenda.end_abs_idx = self.transcript.next_abs_idx - 1
             self.agenda_history.append(self.current_agenda)
 
-        self.current_agenda = AgendaItem(title=title)
+        agenda_id = f"agenda-{len(self.agenda_history) + 1}"
+        self.current_agenda = AgendaSegment(
+            agenda_id=agenda_id,
+            title=title,
+            started_at=time.time(),
+            ended_at=None,
+            status="in_progress",
+            start_abs_idx=self.transcript.next_abs_idx,
+            end_abs_idx=None,
+        )
 
-        print(f"\n[F4][안건전환 {now_hhmm()}] '{title}' (사유: {reason})\n")
-
-    # -----------------------------
-    # 2) 안건 변경 감지
-    # -----------------------------
     async def _check_topic_shift(self):
-        # 최근 텍스트가 너무 없으면 스킵
         w = self._window_text(seconds=120, strip_speaker=True)
         if not w.strip() or not self.current_agenda:
             return
-
-        # 휴리스틱: 특정 전환 신호
         shift_signals = ("다음", "그럼", "넘어가", "전환", "또", "추가로", "마지막으로", "다른 건")
         if any(sig in w for sig in shift_signals):
-            # LLM로 최종 판정
             ok = await self._llm_is_same_agenda(self.current_agenda.title, w)
             if ok is False:
                 await self._propose_and_choose_agenda(reason="안건 변경 감지")
@@ -535,188 +617,273 @@ class MeetingFlowAI:
             return None
         return bool(out["same"])
 
-    # -----------------------------
-    # 3) 안건에 대한 의견/결정/할일 추출해서 정리
-    # -----------------------------
-    async def _flush_opinions_and_updates(self):
-        if not self.current_agenda:
-            return
+    def _agenda_list(self) -> List[AgendaSegment]:
+        ags = list(self.agenda_history)
+        if self.current_agenda:
+            ags.append(self.current_agenda)
+        return ags
 
-        # 최근 3~5분을 대상으로 정리(너무 길면 비용↑)
-        w = self._window_text(seconds=300, strip_speaker=True)
-        if not w.strip():
-            return
+    def _agenda_summary_from_lines(self, lines: List[TranscriptLine], max_sent: int = 2) -> str:
+        if not lines:
+            return ""
+        texts = [l.text for l in lines if l.text]
+        if not texts:
+            return ""
+        return " ".join(texts[:max_sent])
 
-        agenda = self.current_agenda.title
+    def _build_flow_timeline(self) -> List[dict]:
+        if self.progress_timeline:
+            return [{"ts": _ts_to_iso(ts), "text": txt} for ts, txt in list(self.progress_timeline)]
+        items = []
+        lines = list(self.transcript._lines)
+        if not lines:
+            return items
+        step = max(1, len(lines) // 5)
+        for i in range(0, len(lines), step):
+            line = lines[i]
+            items.append({"ts": line.ts_str(), "text": line.text})
+        return items
 
-        system = (
-            "너는 회의 서기다. 특정 안건에 대한 발언에서 '의견', '결정', '할일'을 구조화한다.\n"
-            "모호하면 과장하지 말고, 원문 근거가 약하면 제외한다."
-        )
+    def _validate_minutes(self, data: dict) -> bool:
+        try:
+            if not isinstance(data, dict):
+                return False
+            required = [
+                "basic_info",
+                "inputs",
+                "meeting_text",
+                "flow_summary",
+                "agenda_items",
+                "tasks_by_person",
+                "unassigned_tasks",
+                "risks",
+                "open_questions",
+                "meta",
+            ]
+            for k in required:
+                if k not in data:
+                    return False
+            if not isinstance(data["agenda_items"], list):
+                return False
+            if not isinstance(data["tasks_by_person"], dict):
+                return False
+            if not isinstance(data["unassigned_tasks"], list):
+                return False
+            if not isinstance(data["risks"], list):
+                return False
+            if not isinstance(data["open_questions"], list):
+                return False
+            return True
+        except Exception:
+            return False
+
+    async def _llm_refine_minutes(self, base: dict) -> Tuple[Optional[dict], Optional[str]]:
+        if not self.llm or not getattr(self.llm, "enabled", False):
+            return None, "llm_disabled"
+        system = "너는 회의 서기다. 입력 JSON을 개선해 동일한 스키마로 출력한다."
         user = (
-            f"안건: {agenda}\n\n"
-            f"전사:\n{w}\n\n"
-            "요구:\n"
-            "1) opinions_by_speaker: 화자별로 '의견/주장/제안'을 짧은 불릿으로 최대 3개\n"
-            "2) decisions: 합의/결정된 문장만\n"
-            "3) todos: 해야 할 일을 구체적으로(담당자 추정 가능하면 포함)\n"
-            "4) agenda_summary: 이 안건에서 지금까지 핵심을 2~3문장 요약\n"
+            "아래 JSON을 기준으로 회의록을 다듬어라. "
+            "스키마는 유지하고 내용만 개선한다.\n"
+            f"{json.dumps(base, ensure_ascii=False)}"
         )
-        schema = """
-        {
-          "agenda_summary": "string",
-          "opinions_by_speaker": {
-            "speaker": ["opinion1", "opinion2"]
-          },
-          "decisions": ["..."],
-          "todos": ["..."]
-        }
-        """.strip()
-
+        schema = json.dumps(self._minutes_schema(), ensure_ascii=False)
         out = await self.llm.json_call(system, user, schema)
-
         if not out:
-            # fallback: 최소한의 정리(화자별 마지막 발언)
-            self._fallback_flush(w)
-            return
+            return None, "llm_no_output"
+        if not self._validate_minutes(out):
+            return None, "llm_invalid_schema"
+        return out, None
 
-        agenda_summary = str(out.get("agenda_summary", "")).strip()
-        opinions_by_speaker = out.get("opinions_by_speaker") or {}
-        decisions = out.get("decisions") or []
-        todos = out.get("todos") or []
-
-        # 누적 반영
-        if agenda_summary:
-            self.current_agenda.running_summary = agenda_summary
-
-        if isinstance(opinions_by_speaker, dict):
-            for spk, lst in opinions_by_speaker.items():
-                if not isinstance(lst, list):
-                    continue
-                for it in lst[:3]:
-                    s = str(it).strip()
-                    if s:
-                        self.current_agenda.opinions_by_speaker[str(spk)].append(s)
-
-        for d in decisions:
-            s = str(d).strip()
-            if s and s not in self.current_agenda.decisions:
-                self.current_agenda.decisions.append(s)
-
-        for t in todos:
-            s = str(t).strip()
-            if s and s not in self.current_agenda.todos:
-                self.current_agenda.todos.append(s)
-
-        # 출력
-        self._print_agenda_snapshot()
-
-    def _fallback_flush(self, window_text: str):
-        if not self.current_agenda:
-            return
-        # 화자별 마지막 1~2문장만 추려서 "의견 후보"로 저장
-        last_by = {}
-        for line in window_text.splitlines():
-            spk, txt = parse_transcript_line(line)
-            if txt:
-                last_by[spk] = txt
-
-        for spk, txt in list(last_by.items())[:5]:
-            self.current_agenda.opinions_by_speaker[spk].append(txt[:120])
-
-        self._print_agenda_snapshot(fallback=True)
-
-    def _print_agenda_snapshot(self, fallback: bool = False):
-        ag = self.current_agenda
-        if not ag:
-            return
-
-        tag = "FALLBACK" if fallback else "UPDATE"
-        print("\n" + "-" * 70)
-        print(f"[F4][{tag} {now_hhmm()}] 안건: {ag.title}")
-        if ag.running_summary:
-            print(f"요약: {ag.running_summary}")
-
-        if ag.decisions:
-            print("결정:")
-            for x in ag.decisions[-5:]:
-                print(f"  - {x}")
-
-        if ag.todos:
-            print("할일:")
-            for x in ag.todos[-8:]:
-                print(f"  - {x}")
-
-        if ag.opinions_by_speaker:
-            print("의견(화자별):")
-            # 최근 것 위주로
-            for spk, lst in list(ag.opinions_by_speaker.items())[:8]:
-                recent = lst[-3:]
-                for op in recent:
-                    print(f"  - {spk}: {op}")
-        print("-" * 70 + "\n")
-
-    # 상태 스냅샷
-    def get_state(self) -> dict:
-        ag = self.current_agenda
-        state = {
-            "ts": time.time(),
-            "progress_summary": self.progress_summary,
-            "progress_timeline": [
-                {"t": ts, "text": txt} for (ts, txt) in list(self.progress_timeline)[-10:]
+    def _minutes_schema(self) -> dict:
+        return {
+            "basic_info": {"title": None, "date": None, "participants": [], "location": None},
+            "inputs": {"f2_summary": None, "f3_agenda_info": None},
+            "meeting_text": {"full": "", "excerpt": ""},
+            "flow_summary": {"high_level": "", "timeline": [{"ts": None, "text": ""}]},
+            "agenda_items": [
+                {
+                    "agenda_id": "",
+                    "title": "",
+                    "started_at": None,
+                    "ended_at": None,
+                    "status": "in_progress",
+                    "summary": "",
+                    "ideas": [],
+                    "decisions": [{"text": "", "owner": None, "evidence": []}],
+                    "tasks": [{"text": "", "assignee": None, "due": None, "status": "todo", "evidence": []}],
+                    "issues": [],
+                    "open_questions": [],
+                }
             ],
-            "current_agenda": {},
-            "agenda_history": [],
-            "recent_tail": [],
+            "tasks_by_person": {},
+            "unassigned_tasks": [],
+            "risks": [],
+            "open_questions": [],
+            "meta": {"generated_at": "", "llm_used": False, "fallback_reason": None},
         }
 
-        if ag:
-            state["current_agenda"] = {
+    async def create_meeting_minutes(self) -> dict:
+        participants = self.f1_basic_info.get("participants") if isinstance(self.f1_basic_info, dict) else []
+        extractor = Extractor(participants=participants)
+
+        agenda_items = []
+        all_tasks = []
+        all_open_questions = []
+        all_risks = []
+
+        for ag in self._agenda_list():
+            lines = self.transcript.slice_by_abs_idx(ag.start_abs_idx, ag.end_abs_idx)
+            extracted = extractor.extract_from_lines(lines, self.transcript)
+            summary = ag.running_summary or self._agenda_summary_from_lines(lines)
+            item = {
+                "agenda_id": ag.agenda_id,
                 "title": ag.title,
-                "started_at": ag.started_at,
-                "running_summary": ag.running_summary,
-                "decisions": ag.decisions[-10:],
-                "todos": ag.todos[-15:],
-                "opinions_by_speaker": {
-                    spk: lst[-5:] for spk, lst in ag.opinions_by_speaker.items()
-                },
+                "started_at": _ts_to_iso(ag.started_at),
+                "ended_at": _ts_to_iso(ag.ended_at),
+                "status": ag.status,
+                "summary": summary,
+                "ideas": extracted["ideas"],
+                "decisions": extracted["decisions"],
+                "tasks": extracted["tasks"],
+                "issues": extracted["issues"],
+                "open_questions": extracted["open_questions"],
             }
+            agenda_items.append(item)
+            all_tasks.extend(item["tasks"])
+            all_open_questions.extend(item["open_questions"])
+            all_risks.extend(item["issues"])
 
-        # 최근 전사 일부(화면용)
-        tail = list(self._recent_lines)[-30:]
-        state["recent_tail"] = [
-            {"t": ts, "speaker": spk, "text": txt} for (ts, spk, txt) in tail
-        ]
+        tasks_by_person: Dict[str, List[dict]] = defaultdict(list)
+        unassigned_tasks = []
+        for t in all_tasks:
+            entry = {
+                "text": t.get("text", ""),
+                "due": t.get("due"),
+                "status": t.get("status", "todo"),
+                "agenda_id": None,
+            }
+            if t.get("assignee"):
+                tasks_by_person[t["assignee"]].append(entry)
+            else:
+                unassigned_tasks.append(entry)
 
-        # 완료 안건 히스토리 요약
-        for old in self.agenda_history[-10:]:
-            state["agenda_history"].append({
-                "title": old.title,
-                "started_at": old.started_at,
-                "running_summary": old.running_summary,
-                "decisions": old.decisions[-5:],
-                "todos": old.todos[-8:],
-            })
-            
-        # 아젠다 UI에서 선택 관련
-        state["pending_agenda"] = {
-            "candidates": list(self.pending_agenda.get("candidates", [])),
-            "reason": self.pending_agenda.get("reason", ""),
-            "created_at": self.pending_agenda.get("created_at", 0.0),
+        high_level = self.progress_summary or "회의 내용을 요약 중입니다."
+        flow = {
+            "high_level": high_level,
+            "timeline": self._build_flow_timeline(),
         }
-        state["needs_agenda_choice"] = bool(state["pending_agenda"]["candidates"]) and (self.current_agenda is None)
 
-        # 결정로그 관련
-        state["decision_log"] = [
-            {
-                "t": d.t,
-                "speaker": d.speaker,
-                "text": d.text,
-                "agenda": d.agenda,
-                "confidence": d.confidence,
-                "evidence": d.evidence,
+        base = {
+            "basic_info": {
+                "title": self.f1_basic_info.get("title") if isinstance(self.f1_basic_info, dict) else None,
+                "date": self.f1_basic_info.get("date") if isinstance(self.f1_basic_info, dict) else None,
+                "participants": participants or [],
+                "location": self.f1_basic_info.get("location") if isinstance(self.f1_basic_info, dict) else None,
+            },
+            "inputs": {
+                "f2_summary": self.f2_meeting_summary,
+                "f3_agenda_info": self.f3_agenda_info,
+            },
+            "meeting_text": {
+                "full": self.transcript.full_text(),
+                "excerpt": self.transcript.excerpt_text(),
+            },
+            "flow_summary": flow,
+            "agenda_items": agenda_items,
+            "tasks_by_person": dict(tasks_by_person),
+            "unassigned_tasks": unassigned_tasks,
+            "risks": list(dict.fromkeys(all_risks))[:50],
+            "open_questions": list(dict.fromkeys(all_open_questions))[:50],
+            "meta": {
+                "generated_at": _now_iso(),
+                "llm_used": False,
+                "fallback_reason": None,
+            },
+        }
+
+        llm_out, reason = await self._llm_refine_minutes(base)
+        if llm_out and self._validate_minutes(llm_out):
+            llm_out["meta"]["generated_at"] = _now_iso()
+            llm_out["meta"]["llm_used"] = True
+            llm_out["meta"]["fallback_reason"] = None
+            return llm_out
+
+        base["meta"]["llm_used"] = False
+        base["meta"]["fallback_reason"] = reason
+        if not self._validate_minutes(base):
+            base = self._minutes_schema()
+            base["meta"]["generated_at"] = _now_iso()
+            base["meta"]["llm_used"] = False
+            base["meta"]["fallback_reason"] = "schema_repair"
+        return base
+
+    def get_state(self) -> dict:
+        current_agenda = None
+        if self.current_agenda:
+            current_agenda = {
+                "agenda_id": self.current_agenda.agenda_id,
+                "title": self.current_agenda.title,
+                "started_at": _ts_to_iso(self.current_agenda.started_at),
+                "ended_at": _ts_to_iso(self.current_agenda.ended_at),
+                "status": self.current_agenda.status,
             }
-            for d in list(self.decision_log)[-20:] 
-        ]
+        recent_lines = []
+        for line in self.transcript.slice_by_abs_idx(
+            max(self.transcript.first_abs_idx, self.transcript.next_abs_idx - 30),
+            self.transcript.next_abs_idx - 1,
+        ):
+            recent_lines.append({
+                "t": line.ts_str(),
+                "speaker": line.speaker,
+                "text": line.text,
+            })
 
-        return state
+        agenda_history = []
+        for ag in self.agenda_history[-10:]:
+            agenda_history.append({
+                "agenda_id": ag.agenda_id,
+                "title": ag.title,
+                "started_at": _ts_to_iso(ag.started_at),
+                "ended_at": _ts_to_iso(ag.ended_at),
+                "status": ag.status,
+                "summary": ag.running_summary,
+            })
+
+        return {
+            "ts": _now_iso(),
+            "current_agenda": current_agenda,
+            "pending_agenda_candidates": list(self.pending_agenda.get("candidates", [])),
+            "progress_timeline": [{"ts": _ts_to_iso(ts), "text": txt} for ts, txt in list(self.progress_timeline)],
+            "meeting_text_tail_preview": self.transcript.tail_preview(5),
+            "recent_tail": recent_lines,
+            "decision_log": [],
+            "agenda_history": agenda_history,
+            "candidate_counts": {
+                "agenda_history": len(self.agenda_history),
+                "pending_candidates": len(self.pending_agenda.get("candidates", [])),
+            },
+        }
+
+
+def _test_basic():
+    async def _run():
+        f4 = MeetingFlowAI()
+        f4.update_basic_info({"title": "Weekly Sync", "date": "2026-01-23", "participants": ["Alice", "Bob"], "location": "Room A"})
+        await f4.start()
+        f4.push_transcript_line("[Alice] 이번주 목표 정리하죠")
+        f4.push_transcript_line("[Bob] 이건 결정 사항으로 합시다")
+        f4.push_transcript_line("[Alice] 제가 담당할게요 다음주까지")
+        await asyncio.sleep(0.1)
+        await f4.choose_agenda("주간 목표")
+        await asyncio.sleep(0.1)
+        minutes = await f4.create_meeting_minutes()
+        assert isinstance(minutes, dict)
+        for key in ["basic_info", "inputs", "meeting_text", "flow_summary", "agenda_items", "tasks_by_person", "unassigned_tasks", "risks", "open_questions", "meta"]:
+            assert key in minutes
+        await f4.stop()
+
+    asyncio.run(_run())
+
+
+if __name__ == "__main__":
+    _test_basic()
