@@ -313,6 +313,7 @@ class MeetingFlowAI:
         self._decision_dedupe: Dict[str, float] = {}
         self.decision_context_lines = 2
         self.decision_dedupe_sec = 45
+        self.decision_log: Deque[dict] = deque(maxlen=200)
 
         self.f1_basic_info: Dict[str, Any] = {}
         self.f2_meeting_summary: Optional[str] = None
@@ -393,6 +394,8 @@ class MeetingFlowAI:
                     continue
                 line = self.transcript.add(ts, speaker, text, raw_line)
                 self._recent_lines.append((ts, speaker, text))
+
+                self._maybe_capture_decision(line)
 
                 if self.current_agenda:
                     self.current_agenda.end_abs_idx = line.abs_idx
@@ -631,6 +634,45 @@ class MeetingFlowAI:
             return ""
         return " ".join(texts[:max_sent])
 
+    def _norm_for_dedupe(self, s: str) -> str:
+        s = (s or "").strip().lower()
+        s = re.sub(r"\s+", " ", s)
+        s = re.sub(r"[\"'`]", "", s)
+        return s[:200]
+
+    def _maybe_capture_decision(self, line: TranscriptLine):
+        text = (line.text or "").strip()
+        if len(text) < 4:
+            return
+        kw = Extractor.DECISION_KW
+        if not any(k in text for k in kw):
+            return
+
+        ts_val = line.ts if line.ts is not None else time.time()
+        key = self._norm_for_dedupe(text)
+        last = self._decision_dedupe.get(key, 0.0)
+        if ts_val - last < self.decision_dedupe_sec:
+            return
+        self._decision_dedupe[key] = ts_val
+
+        agenda_title = self.current_agenda.title if self.current_agenda else "Unassigned"
+        evidence = self.transcript.evidence_snippet(line.abs_idx, max_lines=self.decision_context_lines)
+        self.decision_log.append({
+            "t": ts_val,
+            "speaker": line.speaker,
+            "text": text,
+            "agenda": agenda_title,
+            "confidence": 0.6,
+            "evidence": evidence,
+        })
+
+    def _extract_recent_signals(self, max_lines: int = 60) -> Dict[str, Any]:
+        start = max(self.transcript.first_abs_idx, self.transcript.next_abs_idx - max_lines)
+        lines = self.transcript.slice_by_abs_idx(start, self.transcript.next_abs_idx - 1)
+        participants = self.f1_basic_info.get("participants") if isinstance(self.f1_basic_info, dict) else []
+        extractor = Extractor(participants=participants)
+        return extractor.extract_from_lines(lines, self.transcript)
+
     def _build_flow_timeline(self) -> List[dict]:
         if self.progress_timeline:
             return [{"ts": _ts_to_iso(ts), "text": txt} for ts, txt in list(self.progress_timeline)]
@@ -849,6 +891,8 @@ class MeetingFlowAI:
                 "summary": ag.running_summary,
             })
 
+        signals = self._extract_recent_signals()
+
         return {
             "ts": _now_iso(),
             "current_agenda": current_agenda,
@@ -856,8 +900,9 @@ class MeetingFlowAI:
             "progress_timeline": [{"ts": _ts_to_iso(ts), "text": txt} for ts, txt in list(self.progress_timeline)],
             "meeting_text_tail_preview": self.transcript.tail_preview(5),
             "recent_tail": recent_lines,
-            "decision_log": [],
+            "decision_log": list(self.decision_log)[-20:],
             "agenda_history": agenda_history,
+            "signals": signals,
             "candidate_counts": {
                 "agenda_history": len(self.agenda_history),
                 "pending_candidates": len(self.pending_agenda.get("candidates", [])),
