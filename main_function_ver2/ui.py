@@ -92,9 +92,37 @@ tail = data.get("f2_recent_tail") or []
 for x in tail[-40:]:
     st.write(x["line"])
 
+ag = data.get("current_agenda")
+
+st.subheader("결정 로그 (실시간)")
+dlog = data.get("decision_log") or []
+
+if not dlog:
+    st.info("아직 감지된 결정이 없습니다.")
+else:
+    for d in reversed(dlog[-20:]):
+        t = d.get("t", 0.0)
+        spk = d.get("speaker", "")
+        txt = d.get("text", "")
+        agenda = d.get("agenda", "Unassigned")
+        conf = d.get("confidence", None)
+
+        header = f"[{fmt_ts(t)}] ({agenda}) {spk}: {txt}"
+        if conf is not None:
+            header += f"  (conf={conf:.2f})"
+
+        with st.expander(header, expanded=False):
+            ev = d.get("evidence") or []
+            if not ev:
+                st.write("근거 스니펫 없음")
+            else:
+                st.caption("근거(전후 발언)")
+                for e in ev:
+                    st.write(f"- [{fmt_ts(e.get('t', 0.0))}] [{e.get('speaker','')}] {e.get('text','')}")
+
 col1, col2 = st.columns([1, 1])
 
-ag = data.get("current_agenda")
+
 
 with col1:
     st.subheader("현재 안건")

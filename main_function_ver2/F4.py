@@ -88,6 +88,15 @@ class AgendaItem:
     decisions: List[str] = field(default_factory=list)
     todos: List[str] = field(default_factory=list)
 
+# 결정으로 보이는 발언 캡쳐용
+@dataclass
+class DecisionLogItem:
+    t: float
+    speaker: str
+    text: str
+    agenda: str
+    evidence: List[dict]
+    confidence: float = 0.6
 
 # -----------------------------
 # 핵심: 실시간 회의 흐름 AI
@@ -141,6 +150,16 @@ class MeetingFlowAI:
         self.progress_summary = ""
         self.progress_timeline = deque(maxlen=50)
 
+        # 결정 로그
+        self.decision_log: Deque[DecisionLogItem] = deque(maxlen=200)
+
+        # 같은 결정 중복 방지용
+        self._decision_dedupe: Dict[str, float] = {}
+
+        # 파라미터
+        self.decision_context_lines = 2 # 근거 부분 몇줄
+        self.decision_dedupe_sec = 45 # 중복 방지용 시간설정
+
         # 외부(연결파일)에서 호출
     def push_transcript_line(self, line: str):
         # queue.put_nowait는 event loop에서만 안전 -> 연결파일에서 call_soon_threadsafe로 호출하도록 설계함
@@ -180,6 +199,8 @@ class MeetingFlowAI:
                     continue
 
                 self._recent_lines.append((ts, speaker, text))
+                # 결정 로그 감지
+                self._maybe_capture_decision(ts, speaker, text)
 
                 # 안건이 아직 없고 충분히 쌓였으면 후보 제시
                 if (self.current_agenda is None) and (len(self._recent_lines) >= self.propose_min_lines):
@@ -227,6 +248,78 @@ class MeetingFlowAI:
                 break
             except Exception as e:
                 print(f"[F4] periodic error: {e}")
+
+    # ---------------------------------
+    # 결정 감지용
+    _DECISION_PATTERNS = [
+        r"\b결정(하|됐|되었|합니다|하자|하기로)\b",
+        r"\b확정(하|됐|되었|합니다|하자|하기로)\b",
+        r"\b합의(하|됐|되었|합니다|하자|하기로)\b",
+        r"\b정하(자|죠|겠습니다|기로)\b",
+        r"\b채택(하|됐|하기로)\b",
+        r"\b그렇게\s*하(자|죠|겠습니다)\b",
+        r"\b오케이\b",
+        r"\bOK\b",
+        r"\b콜\b",
+        r"\b가시죠\b",
+        r".+로\s*(하자|가자|결정|확정|정하자)",
+    ]
+
+    _DECISION_RE = re.compile("|".join(f"(?:{p})" for p in _DECISION_PATTERNS), re.IGNORECASE)
+
+    def _norm_for_dedupe(self, s: str) -> str:
+        s = (s or "").strip().lower()
+        s = re.sub(r"\s+", " ", s)
+        s = re.sub(r"[\"'`]", "", s)
+        return s[:200]
+
+    # 주변 문장 스니펫
+    def _get_context_snippet(self, center_idx: int) -> List[dict]:
+        items = list(self._recent_lines)
+        if not items:
+            return []
+        lo = max(0, center_idx - self.decision_context_lines)
+        hi = min(len(items), center_idx + self.decision_context_lines + 1)
+        out = []
+        for ts, spk, txt in items[lo:hi]:
+            out.append({"t": ts, "speaker": spk, "text": txt})
+        return out
+
+    # 결정 발언 로그에 추가
+    def _maybe_capture_decision(self, ts: float, speaker: str, text: str):
+        if not text or len(text) < 4:
+            return
+
+        if not self._DECISION_RE.search(text):
+            return
+
+        key = self._norm_for_dedupe(text)
+        last = self._decision_dedupe.get(key, 0.0)
+        if ts - last < self.decision_dedupe_sec:
+            return
+        self._decision_dedupe[key] = ts
+
+        center_idx = len(self._recent_lines) - 1
+        evidence = self._get_context_snippet(center_idx)
+
+        agenda_title = self.current_agenda.title if self.current_agenda else "Unassigned"
+
+        item = DecisionLogItem(
+            t=ts,
+            speaker=speaker,
+            text=text.strip(),
+            agenda=agenda_title,
+            evidence=evidence,
+            confidence=0.6,
+        )
+        self.decision_log.append(item)
+
+        # 안건 있으면 decision에도 넣기
+        if self.current_agenda:
+            if item.text not in self.current_agenda.decisions:
+                self.current_agenda.decisions.append(item.text)
+
+        print(f"\n[F4][결정로그 {now_hhmm()}] ({agenda_title}) {speaker}: {item.text}\n")
 
     # -----------------------------
     # 텍스트 윈도우 만들기
@@ -612,5 +705,18 @@ class MeetingFlowAI:
             "created_at": self.pending_agenda.get("created_at", 0.0),
         }
         state["needs_agenda_choice"] = bool(state["pending_agenda"]["candidates"]) and (self.current_agenda is None)
+
+        # 결정로그 관련
+        state["decision_log"] = [
+            {
+                "t": d.t,
+                "speaker": d.speaker,
+                "text": d.text,
+                "agenda": d.agenda,
+                "confidence": d.confidence,
+                "evidence": d.evidence,
+            }
+            for d in list(self.decision_log)[-20:] 
+        ]
 
         return state
